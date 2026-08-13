@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+mock_erp.db
+sample_emails.json
+batch_test_results.json
+.env
