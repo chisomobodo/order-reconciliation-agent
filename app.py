@@ -15,7 +15,7 @@ import pandas as pd
 import sqlite3
 import streamlit as st
 
-from agent_engine import run_agent
+from agent_engine import run_agent, commit_order_modification
 from theme import build_css, step_card_html, stamp_html
 
 st.set_page_config(layout="wide", page_title="Reconciliation Agent", page_icon="📦")
@@ -24,7 +24,31 @@ st.set_page_config(layout="wide", page_title="Reconciliation Agent", page_icon="
 if "theme" not in st.session_state:
     st.session_state.theme = "dark"
 
+# --- Human-approval state ---
+# pending_approval holds the proposed change (order_id, mapped_sku,
+# requested_quantity) awaiting a manual decision; None when nothing is
+# waiting. last_commit_result holds the outcome of the most recent
+# commit/reject action, so it stays visible across reruns instead of
+# flashing and disappearing.
+if "pending_approval" not in st.session_state:
+    st.session_state.pending_approval = None
+if "last_commit_result" not in st.session_state:
+    st.session_state.last_commit_result = None
+
 st.markdown(build_css(st.session_state.theme), unsafe_allow_html=True)
+
+
+def find_verified_change(tool_log):
+    """Scans a run's tool log for a verify_order_modification call that
+    came back Success, and returns its inputs (order_id, mapped_sku,
+    requested_quantity) -- the proposed change a human (or auto-approve)
+    can now commit. Returns None if no such call is present."""
+    if not tool_log:
+        return None
+    for call in reversed(tool_log):
+        if call["tool_called"] == "verify_order_modification" and call["result"].get("status") == "Success":
+            return call["inputs"]
+    return None
 
 
 def get_db_snapshot():
@@ -44,7 +68,7 @@ def load_sample_emails():
 
 
 # --- Header ---
-header_col, toggle_col = st.columns([5, 1])
+header_col, approve_toggle_col, theme_toggle_col = st.columns([4, 1.4, 1])
 with header_col:
     st.markdown(
         """
@@ -53,7 +77,10 @@ with header_col:
         """,
         unsafe_allow_html=True,
     )
-with toggle_col:
+with approve_toggle_col:
+    st.write("")
+    st.toggle("Auto-approve changes", key="auto_approve", value=False)
+with theme_toggle_col:
     st.write("")
     label = "☀️ Light mode" if st.session_state.theme == "dark" else "🌙 Dark mode"
     if st.button(label, type="secondary", use_container_width=True):
@@ -112,9 +139,24 @@ with col2:
                     "final_result": final_result,
                     "reply": reply,
                 }
+                # A fresh run supersedes whatever approval state was left
+                # over from the previous email.
+                st.session_state.pending_approval = None
+                st.session_state.last_commit_result = None
+
                 if final_result and final_result.get("status") == "Success":
-                    st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
-                    st.rerun()
+                    verified_change = find_verified_change(tool_log)
+                    if verified_change:
+                        if st.session_state.auto_approve:
+                            commit_result = commit_order_modification(**verified_change)
+                            st.session_state.last_commit_result = commit_result
+                            if commit_result.get("status") == "Success":
+                                st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
+                            else:
+                                st.toast(f"Auto-approve commit failed: {commit_result.get('message')}", icon="⚠️")
+                        else:
+                            st.session_state.pending_approval = verified_change
+                        st.rerun()
             except Exception as e:
                 st.session_state.last_result = {"error": str(e)}
 
@@ -150,6 +192,44 @@ with col2:
 
             st.markdown("**Reply to Customer**")
             st.markdown(f'<div class="reply-card">{reply}</div>', unsafe_allow_html=True)
+
+            # --- Human approval gate for the database write ---
+            if st.session_state.pending_approval:
+                pending = st.session_state.pending_approval
+                st.markdown("**Database Write**")
+                st.markdown(stamp_html("Pending Approval"), unsafe_allow_html=True)
+                st.markdown(
+                    f"""<div class="reply-card">
+                    Order: <b>{pending['order_id']}</b><br>
+                    SKU: <b>{pending['mapped_sku']}</b><br>
+                    New quantity: <b>{pending['requested_quantity']}</b>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+                approve_col, reject_col = st.columns(2)
+                with approve_col:
+                    if st.button("✅ Approve & Apply", type="primary", use_container_width=True):
+                        commit_result = commit_order_modification(**pending)
+                        st.session_state.last_commit_result = commit_result
+                        st.session_state.pending_approval = None
+                        if commit_result.get("status") == "Success":
+                            st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
+                        else:
+                            st.toast(f"Commit failed: {commit_result.get('message')}", icon="⚠️")
+                        st.rerun()
+                with reject_col:
+                    if st.button("❌ Reject", use_container_width=True):
+                        st.session_state.pending_approval = None
+                        st.session_state.last_commit_result = {
+                            "status": "Rejected by Reviewer",
+                            "message": "Change discarded by reviewer — no database write performed.",
+                        }
+                        st.rerun()
+            elif st.session_state.last_commit_result:
+                commit_result = st.session_state.last_commit_result
+                st.markdown("**Database Write**")
+                st.markdown(stamp_html(commit_result.get("status", "?")), unsafe_allow_html=True)
+                st.caption(commit_result.get("message", ""))
 
     if not run_clicked and "last_result" not in st.session_state:
         st.info("Select or write an email on the left, then click **Process with Agent**.")

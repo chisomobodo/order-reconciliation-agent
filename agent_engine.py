@@ -10,10 +10,19 @@ new absolute total itself, then proceeds to the modification check.
 
 Three tool paths, matching agent_config.py:
   - get_order_details          -> read-only lookup, no DB write
-  - verify_order_modification  -> checks the mock ERP, applies the change
+  - verify_order_modification  -> checks the mock ERP for feasibility only
   - request_clarification      -> no DB write; packages the clarifying
                                    question, and short-circuits the loop
                                    since that question IS the reply
+
+Human-approval gate: verify_order_modification (called from within
+Claude's tool-use loop) only ever checks feasibility -- it never writes.
+The actual database write lives in commit_order_modification, which is
+NEVER called from this loop. It's called only from the app layer
+(app.py), after a human has approved the proposed change -- either via
+an explicit click or an auto-approve toggle. This means a wrong or
+premature commit can't happen just because Claude decided to call a
+tool.
 """
 import json
 import sqlite3
@@ -53,11 +62,10 @@ def get_order_details(order_id):
     }
 
 
-def execute_db_check_and_update(order_id, mapped_sku, requested_quantity):
-    """Runs the reconciliation logic against the mock ERP."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
+def _validate_modification(cursor, order_id, mapped_sku, requested_quantity):
+    """Shared feasibility logic used by both check_order_modification and
+    commit_order_modification. Returns (error_dict, quantity_difference)
+    -- error_dict is None when the change is feasible."""
     cursor.execute(
         "SELECT quantity, delivery_status FROM orders WHERE order_id = ?",
         (order_id,),
@@ -65,16 +73,14 @@ def execute_db_check_and_update(order_id, mapped_sku, requested_quantity):
     order = cursor.fetchone()
 
     if not order:
-        conn.close()
-        return {"status": "Error", "message": f"Order {order_id} not found in system."}
+        return {"status": "Error", "message": f"Order {order_id} not found in system."}, None
 
     current_qty, status = order
     if status in ("Dispatched", "Delivered"):
-        conn.close()
         return {
             "status": "Rejected",
             "message": f"Cannot modify order. Status is already '{status}'.",
-        }
+        }, None
 
     cursor.execute("SELECT available_stock FROM inventory WHERE sku = ?", (mapped_sku,))
     stock_record = cursor.fetchone()
@@ -83,14 +89,45 @@ def execute_db_check_and_update(order_id, mapped_sku, requested_quantity):
     quantity_difference = requested_quantity - current_qty
 
     if quantity_difference > available_stock:
-        conn.close()
         return {
             "status": "Insufficient Stock",
             "message": (
                 f"Requested {requested_quantity} units. "
                 f"Short by {quantity_difference - available_stock} units."
             ),
-        }
+        }, None
+
+    return None, quantity_difference
+
+
+def check_order_modification(order_id, mapped_sku, requested_quantity):
+    """Read-only feasibility check against the mock ERP -- never writes.
+    This is what Claude's tool-use loop calls. A 'Success' status here
+    means the change is feasible, NOT that it has been applied; the
+    actual write only happens later via commit_order_modification, after
+    a human has approved it."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    error, _ = _validate_modification(cursor, order_id, mapped_sku, requested_quantity)
+    conn.close()
+
+    if error:
+        return error
+    return {"status": "Success", "message": "Change is feasible and pending approval."}
+
+
+def commit_order_modification(order_id, mapped_sku, requested_quantity):
+    """Re-validates from scratch, then applies the UPDATE statements. This
+    is the only function that writes to the database -- it must NEVER be
+    called from within Claude's tool-use loop, only from the app layer,
+    after a human has approved the change."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    error, quantity_difference = _validate_modification(cursor, order_id, mapped_sku, requested_quantity)
+    if error:
+        conn.close()
+        return error
 
     try:
         cursor.execute(
@@ -128,7 +165,7 @@ def _execute_tool(tool_name, tool_inputs):
         return get_order_details(order_id=tool_inputs["order_id"]), False
 
     if tool_name == "verify_order_modification":
-        result = execute_db_check_and_update(
+        result = check_order_modification(
             order_id=tool_inputs["order_id"],
             mapped_sku=tool_inputs["mapped_sku"],
             requested_quantity=tool_inputs["requested_quantity"],

@@ -31,6 +31,13 @@ Key design decisions (the interview-question answers):
      call makes behavior predictable and gives every order-referencing
      email a consistent audit log entry, at the cost of a small number of
      extra tool calls (cheap, since it's a Haiku-cost lookup either way).
+  4. `verify_order_modification` only checks feasibility now -- it no
+     longer writes to the database. The write is a separate function
+     (`commit_order_modification` in agent_engine.py) that only the app
+     layer can call, after a human approves the proposed change. This
+     closes the gap where Claude's tool call was also the database write:
+     a hallucinated or premature tool call could never silently mutate
+     the ERP again.
 """
 
 SYSTEM_PROMPT = """You are the Autonomous Supply Chain Reconciliation Agent for a beverage wholesale distributor. Your job is to process inbound customer order-adjustment emails.
@@ -55,7 +62,7 @@ You must follow these strict operational rules:
 
 9. If that tool reports 'Insufficient Stock', offer a partial fulfilment or flag an exception. Do not update the order.
 
-10. Only confirm a change to the customer if `verify_order_modification` returns a 'Success' status.
+10. If `verify_order_modification` returns a 'Success' status, that means the change has been confirmed as FEASIBLE only -- it has NOT been applied to the database yet. Phrase your reply provisionally, e.g. "This change has been confirmed as feasible and is being processed," never as an unconditional "done," "updated," or "your order has been changed." The actual database write is a separate step outside your control, pending human approval.
 
 11. When you call `request_clarification`, draft a short, specific question back to the customer listing the exact options they need to choose between (e.g. "Did you mean the 50L or 30L keg?"). Do not ask a vague "can you clarify?" question.
 """
@@ -64,9 +71,11 @@ You must follow these strict operational rules:
 verify_order_modification_tool = {
     "name": "verify_order_modification",
     "description": (
-        "Validates if an order can be modified based on current inventory "
-        "levels and delivery dispatch status. Only call this when the SKU "
-        "is unambiguous."
+        "Checks whether an order CAN be modified, based on current "
+        "inventory levels and delivery dispatch status. This only "
+        "validates feasibility -- it does NOT apply the change to the "
+        "database. A human reviewer applies the change separately after "
+        "approval. Only call this when the SKU is unambiguous."
     ),
     "input_schema": {
         "type": "object",
