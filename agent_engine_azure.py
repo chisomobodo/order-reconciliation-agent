@@ -35,11 +35,18 @@ DATABASE = os.environ["AZURE_SQL_DATABASE"]
 USERNAME = os.environ["AZURE_SQL_USERNAME"]
 PASSWORD = os.environ["AZURE_SQL_PASSWORD"]
 
+# The Linux ODBC driver (used inside the Docker container) does not
+# auto-append the server name to the login the way the Windows driver
+# does -- it must be explicit as "username@short-server-name", or the
+# login silently hangs until timeout. Harmless to include on Windows too.
+SERVER_SHORT_NAME = SERVER.split(".")[0]
+UID = f"{USERNAME}@{SERVER_SHORT_NAME}"
+
 CONNECTION_STRING = (
     "DRIVER={ODBC Driver 18 for SQL Server};"
     f"SERVER=tcp:{SERVER},1433;"
     f"DATABASE={DATABASE};"
-    f"UID={USERNAME};"
+    f"UID={UID};"
     f"PWD={PASSWORD};"
     "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
 )

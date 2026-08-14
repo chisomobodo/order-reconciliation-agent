@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+mock_erp.db
+batch_test_results.json
+.env
+streamlit_log*.txt

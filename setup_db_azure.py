@@ -23,11 +23,16 @@ DATABASE = os.environ["AZURE_SQL_DATABASE"]
 USERNAME = os.environ["AZURE_SQL_USERNAME"]
 PASSWORD = os.environ["AZURE_SQL_PASSWORD"]
 
+# See agent_engine_azure.py for why this suffix is required under the
+# Linux ODBC driver.
+SERVER_SHORT_NAME = SERVER.split(".")[0]
+UID = f"{USERNAME}@{SERVER_SHORT_NAME}"
+
 CONNECTION_STRING = (
     "DRIVER={ODBC Driver 18 for SQL Server};"
     f"SERVER=tcp:{SERVER},1433;"
     f"DATABASE={DATABASE};"
-    f"UID={USERNAME};"
+    f"UID={UID};"
     f"PWD={PASSWORD};"
     "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
 )
