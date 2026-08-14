@@ -9,16 +9,45 @@ generic analytics-dashboard skin.
 Run with: streamlit run app.py
 """
 import json
+import os
 import time
 
 import pandas as pd
 import sqlite3
 import streamlit as st
 
-from agent_engine import run_agent, commit_order_modification
 from theme import build_css, step_card_html, stamp_html
 
 st.set_page_config(layout="wide", page_title="Reconciliation Agent", page_icon="📦")
+
+# --- Backend selection: local SQLite (fast iteration) vs Azure SQL (cloud
+# demo). USE_AZURE_DB=true switches both the agent's tool backend and the
+# sidebar's live ERP view. Defaults to local SQLite. If Azure is requested
+# but agent_engine_azure can't be imported (missing env vars, bad driver,
+# etc.), we don't crash -- DB_INIT_ERROR is surfaced in the UI instead, and
+# run_agent/commit_order_modification are left as None so any accidental
+# call fails loudly rather than silently doing nothing.
+USE_AZURE_DB = os.environ.get("USE_AZURE_DB") == "true"
+DB_INIT_ERROR = None
+get_azure_connection = None
+
+if USE_AZURE_DB:
+    DB_MODE = "Azure SQL"
+    try:
+        from agent_engine_azure import (
+            run_agent,
+            commit_order_modification,
+            get_connection as get_azure_connection,
+        )
+    except KeyError as e:
+        DB_INIT_ERROR = f"Missing environment variable: {e.args[0]}"
+        run_agent = commit_order_modification = None
+    except Exception as e:
+        DB_INIT_ERROR = str(e)
+        run_agent = commit_order_modification = None
+else:
+    DB_MODE = "Local SQLite"
+    from agent_engine import run_agent, commit_order_modification
 
 # --- Theme state ---
 if "theme" not in st.session_state:
@@ -51,12 +80,31 @@ def find_verified_change(tool_log):
     return None
 
 
+def db_mode_badge_html(mode: str, has_error: bool) -> str:
+    """Small stamp badge for the header showing which DB backend is live.
+    Reuses the existing .stamp CSS classes from theme.py rather than
+    introducing a new component."""
+    variant = "stamp-danger" if has_error else "stamp-info"
+    label = f"{mode} · CONNECTION ERROR" if has_error else mode
+    return (
+        f'<span class="stamp {variant}" '
+        f'style="font-size:0.7rem; padding:4px 12px; transform: rotate(-2deg);">{label}</span>'
+    )
+
+
 def get_db_snapshot():
-    conn = sqlite3.connect("mock_erp.db")
-    inv_df = pd.read_sql_query("SELECT * FROM inventory", conn)
-    ord_df = pd.read_sql_query("SELECT * FROM orders", conn)
-    conn.close()
-    return inv_df, ord_df
+    """Returns (inventory_df, orders_df, error). error is None on success;
+    when set, the sidebar shows it instead of crashing the app."""
+    if DB_INIT_ERROR:
+        return None, None, DB_INIT_ERROR
+    try:
+        conn = get_azure_connection() if USE_AZURE_DB else sqlite3.connect("mock_erp.db")
+        inv_df = pd.read_sql_query("SELECT * FROM inventory", conn)
+        ord_df = pd.read_sql_query("SELECT * FROM orders", conn)
+        conn.close()
+        return inv_df, ord_df, None
+    except Exception as e:
+        return None, None, str(e)
 
 
 def load_sample_emails():
@@ -71,12 +119,20 @@ def load_sample_emails():
 header_col, approve_toggle_col, theme_toggle_col = st.columns([4, 1.4, 1])
 with header_col:
     st.markdown(
-        """
+        f"""
         <div class="manifest-title"><span class="accent-bar"></span>Reconciliation Agent</div>
         <div class="manifest-sub">PORTFOLIO PROTOTYPE · CLAUDE SONNET 5 · FICTIONAL COMPANY, FICTIONAL DATA</div>
+        <div style="margin-top: 8px;">{db_mode_badge_html(DB_MODE, bool(DB_INIT_ERROR))}</div>
         """,
         unsafe_allow_html=True,
     )
+    if DB_INIT_ERROR:
+        st.error(
+            f"USE_AZURE_DB is set, but the app couldn't connect to Azure SQL: {DB_INIT_ERROR}\n\n"
+            "Check that AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, and "
+            "AZURE_SQL_PASSWORD are set correctly, then restart the app. Or set "
+            "USE_AZURE_DB=false (or unset it) to fall back to the local SQLite backend."
+        )
 with approve_toggle_col:
     st.write("")
     st.toggle("Auto-approve changes", key="auto_approve", value=False)
@@ -92,12 +148,15 @@ st.write("")
 # --- Sidebar: live ERP ledger ---
 with st.sidebar:
     st.header("Live ERP State")
-    inv, ords = get_db_snapshot()
-    st.subheader("Inventory")
-    st.dataframe(inv, use_container_width=True, hide_index=True)
-    st.subheader("Orders")
-    st.dataframe(ords, use_container_width=True, hide_index=True)
-    st.caption("Refreshes automatically after each successful reconciliation.")
+    inv, ords, db_error = get_db_snapshot()
+    if db_error:
+        st.error(f"Could not load {DB_MODE} state:\n\n{db_error}")
+    else:
+        st.subheader("Inventory")
+        st.dataframe(inv, use_container_width=True, hide_index=True)
+        st.subheader("Orders")
+        st.dataframe(ords, use_container_width=True, hide_index=True)
+    st.caption(f"Backend: {DB_MODE}. Refreshes automatically after each successful reconciliation.")
 
 # --- Main layout ---
 col1, col2 = st.columns(2)
@@ -122,7 +181,11 @@ with col1:
         st.info("No sample_emails.json found — run generate_test_emails.py first for pre-built test cases.")
         email_body = st.text_area("Email content:", height=200, placeholder="Paste or type a customer email here...")
 
-    run_clicked = st.button("Process with Agent", type="primary", disabled=not email_body.strip())
+    run_clicked = st.button(
+        "Process with Agent",
+        type="primary",
+        disabled=not email_body.strip() or bool(DB_INIT_ERROR),
+    )
 
 with col2:
     st.subheader("Agent Execution")
