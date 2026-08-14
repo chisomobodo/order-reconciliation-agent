@@ -41,7 +41,8 @@ are invented.
 - [x] Azure SQL backend (`agent_engine_azure.py`, `setup_db_azure.py`) —
       swappable via `USE_AZURE_DB`, with a UI-visible mode badge and a
       graceful (non-crashing) error path if the connection isn't configured
-- [ ] Containerize + deploy (Azure Container Apps)
+- [x] Containerized with Docker and deployed to Azure Container Apps,
+      backed by Azure SQL Database (see "Docker & Deployment" below)
 
 ## How it works
 
@@ -62,6 +63,25 @@ are invented.
    toggle on) or waits as a "Pending Approval" stamp with **Approve & Apply**
    / **Reject** buttons (the default). Only `commit_order_modification` —
    called from the app layer, never from Claude's loop — actually writes.
+
+## Project structure
+
+```
+agent_config.py            System prompt + tool definitions (3 tools)
+agent_engine.py             Orchestration loop, SQLite backend
+agent_engine_azure.py        Orchestration loop, Azure SQL backend (pyodbc)
+app.py                        Streamlit dashboard
+theme.py                       Design system (shipping-manifest aesthetic, stamp badges)
+setup_db.py                     Mock ERP schema + seed data (SQLite)
+setup_db_azure.py                Mock ERP schema + seed data (Azure SQL)
+generate_test_emails.py           Generates sample_emails.json via Claude
+run_batch_test.py                  Batch-runs sample_emails.json through the agent
+test_agent.py                       Quick manual test (2 hand-picked emails)
+test_azure_connection.py             Sanity check for the Azure SQL backend
+Dockerfile                            Container build (Python 3.11, ODBC Driver 18)
+.dockerignore                          Excludes venv, local DB, .env, etc. from the build context
+requirements.txt                        Python dependencies
+```
 
 ## Setup
 
@@ -114,6 +134,32 @@ badge for whichever backend is active. If `USE_AZURE_DB=true` but the driver
 or env vars are missing, `app.py` shows a connection error in the UI rather
 than crashing — it does not fall back to SQLite automatically.
 
+## Docker & Deployment
+
+The app is containerized (`Dockerfile`, `.dockerignore`) and deployed to
+Azure Container Apps, backed by Azure SQL Database. The image is Python 3.11
+on Debian bookworm with the ODBC Driver 18 for SQL Server installed for
+`pyodbc`; `USE_AZURE_DB=true` is set inside the image, since a stateless
+container has no reason to run against local SQLite.
+
+Build and run locally:
+
+```bash
+docker build -t reconciliation-agent .
+docker run -p 8501:8501 --env-file .env reconciliation-agent
+```
+
+Deployment: built and tested locally, then pushed directly to Azure
+Container Registry and deployed via the Azure CLI. This was necessary
+because ACR Tasks (Azure's remote build service) is restricted on Azure for
+Students subscriptions.
+
+### Notable engineering challenges
+
+- Azure for Students subscription region restrictions — had to identify the actual allowed regions via policy rather than the general Azure region list
+- ACR Tasks (remote container builds) is blocked for student subscriptions — worked around by building locally and pushing the image directly
+- Diagnosed a persistent Docker-to-Azure-SQL connection failure by systematically ruling out DNS, network connectivity, TLS certificates, and MTU issues before finding the actual causes: a malformed `.env` file and a Linux-ODBC-driver-specific login format requirement
+
 ## Design notes worth remembering
 
 **Ambiguity handling (`request_clarification`).** An enum-constrained tool
@@ -151,3 +197,11 @@ or premature tool call could silently mutate the ERP.
 contract and approval-gate split, so `app.py` can switch between them via
 `USE_AZURE_DB` without changing any agent logic — fast local iteration day
 to day, with a working cloud version to demo when needed.
+
+## Limitations & Production Considerations
+
+This is a prototype, not a production system:
+
+- No real email ingestion pipeline — emails are pasted or selected in the UI, not received via IMAP/webhook
+- No real ERP integration — the "ERP" is a mock schema seeded with invented data
+- Product catalog is a hardcoded SKU list in `agent_config.py`'s tool schema, not a real product-catalog lookup
