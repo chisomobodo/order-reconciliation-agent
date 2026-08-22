@@ -48,7 +48,10 @@ CONNECTION_STRING = (
     f"DATABASE={DATABASE};"
     f"UID={UID};"
     f"PWD={PASSWORD};"
-    "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+    # Short timeout so a cold connection fails fast rather than eating
+    # most of the retry budget in app.py's get_db_snapshot() on a single
+    # attempt -- a warm connection succeeds well within 10s regardless.
+    "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=10;"
 )
 
 

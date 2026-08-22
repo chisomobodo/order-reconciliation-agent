@@ -92,19 +92,42 @@ def db_mode_badge_html(mode: str, has_error: bool) -> str:
     )
 
 
+DB_SNAPSHOT_MAX_ATTEMPTS = 5  # Azure SQL only -- see get_db_snapshot
+DB_SNAPSHOT_RETRY_DELAY_S = 1.5
+
+
 def get_db_snapshot():
     """Returns (inventory_df, orders_df, error). error is None on success;
-    when set, the sidebar shows it instead of crashing the app."""
+    when set, the sidebar shows it instead of crashing the app.
+
+    Azure SQL gets retried up to DB_SNAPSHOT_MAX_ATTEMPTS times: on a
+    Container Apps cold start, the very first request can hit "Login
+    timeout expired (SQLDriverConnect)" while the container's network path
+    to Azure SQL (DNS, TLS session) is still warming up, even though the
+    connection succeeds moments later. Local SQLite has no such cold-start
+    path, so it stays a single attempt. This can block for a while in the
+    worst case -- the caller is expected to wrap the call in a scoped
+    loading indicator (e.g. st.spinner) rather than let it block silently.
+    """
     if DB_INIT_ERROR:
         return None, None, DB_INIT_ERROR
-    try:
-        conn = get_azure_connection() if USE_AZURE_DB else sqlite3.connect("mock_erp.db")
-        inv_df = pd.read_sql_query("SELECT * FROM inventory", conn)
-        ord_df = pd.read_sql_query("SELECT * FROM orders", conn)
-        conn.close()
-        return inv_df, ord_df, None
-    except Exception as e:
-        return None, None, str(e)
+
+    attempts = DB_SNAPSHOT_MAX_ATTEMPTS if USE_AZURE_DB else 1
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            conn = get_azure_connection() if USE_AZURE_DB else sqlite3.connect("mock_erp.db")
+            inv_df = pd.read_sql_query("SELECT * FROM inventory", conn)
+            ord_df = pd.read_sql_query("SELECT * FROM orders", conn)
+            conn.close()
+            return inv_df, ord_df, None
+        except Exception as e:
+            last_error = str(e)
+            if attempt < attempts:
+                time.sleep(DB_SNAPSHOT_RETRY_DELAY_S)
+
+    return None, None, last_error
 
 
 def load_sample_emails():
@@ -144,19 +167,6 @@ with theme_toggle_col:
         st.rerun()
 
 st.write("")
-
-# --- Sidebar: live ERP ledger ---
-with st.sidebar:
-    st.header("Live ERP State")
-    inv, ords, db_error = get_db_snapshot()
-    if db_error:
-        st.error(f"Could not load {DB_MODE} state:\n\n{db_error}")
-    else:
-        st.subheader("Inventory")
-        st.dataframe(inv, use_container_width=True, hide_index=True)
-        st.subheader("Orders")
-        st.dataframe(ords, use_container_width=True, hide_index=True)
-    st.caption(f"Backend: {DB_MODE}. Refreshes automatically after each successful reconciliation.")
 
 # --- Main layout ---
 col1, col2 = st.columns(2)
@@ -296,3 +306,25 @@ with col2:
 
     if not run_clicked and "last_result" not in st.session_state:
         st.info("Select or write an email on the left, then click **Process with Agent**.")
+
+# --- Sidebar: live ERP ledger ---
+# Rendered last, after the header/CSS/toggles and the main email/agent
+# panel are already fully sent to the browser. get_db_snapshot() can block
+# for up to ~56s on an Azure SQL cold start (see its docstring); placing it
+# here -- rather than before the main layout -- means that wait never holds
+# up the page shell or the email input/process button, which render (and
+# are usable) from the earlier part of this same script run. st.sidebar is
+# a fixed screen region, so its position in the script doesn't change
+# where it appears on screen, only when its content becomes available.
+with st.sidebar:
+    st.header("Live ERP State")
+    with st.spinner(f"Connecting to {DB_MODE}..."):
+        inv, ords, db_error = get_db_snapshot()
+    if db_error:
+        st.error(f"Could not load {DB_MODE} state:\n\n{db_error}")
+    else:
+        st.subheader("Inventory")
+        st.dataframe(inv, use_container_width=True, hide_index=True)
+        st.subheader("Orders")
+        st.dataframe(ords, use_container_width=True, hide_index=True)
+    st.caption(f"Backend: {DB_MODE}. Refreshes automatically after each successful reconciliation.")
