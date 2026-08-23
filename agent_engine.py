@@ -28,6 +28,8 @@ import json
 import sqlite3
 
 import anthropic
+import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from agent_config import SYSTEM_PROMPT, TOOLS
 
@@ -36,9 +38,38 @@ MODEL = "claude-sonnet-5"
 DB_PATH = "mock_erp.db"
 MAX_TOOL_ROUNDS = 5  # safety cap so a confused agent can't loop forever
 
+# Fallback cache for callers outside a real Streamlit session (test_agent.py,
+# run_batch_test.py, test_azure_connection.py all call run_agent() directly
+# via `python script.py`, not `streamlit run`). Never used when the app is
+# actually running -- see _order_cache().
+_FALLBACK_ORDER_CACHE = {}
+
+
+def _order_cache():
+    """dict to cache get_order_details lookups in, keyed by order_id.
+    Backed by st.session_state when running inside a real Streamlit
+    session, so each user's cache is their own -- one visitor's lookups
+    can never leak into another's. Falls back to a plain module-level dict
+    for the CLI entry points, which have no session concept anyway (each
+    invocation is its own short-lived process)."""
+    if get_script_run_ctx() is not None:
+        if "order_details_cache" not in st.session_state:
+            st.session_state.order_details_cache = {}
+        return st.session_state.order_details_cache
+    return _FALLBACK_ORDER_CACHE
+
 
 def get_order_details(order_id):
-    """Read-only lookup. Never writes to the database."""
+    """Read-only lookup. Never writes to the database.
+
+    Cached per session (see _order_cache) since the same order is often
+    looked up more than once while working through an email. The cache is
+    invalidated for a specific order_id the moment commit_order_modification
+    writes a change to it, so a hit here can never return pre-update data."""
+    cache = _order_cache()
+    if order_id in cache:
+        return cache[order_id]
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
@@ -49,17 +80,20 @@ def get_order_details(order_id):
     conn.close()
 
     if not order:
-        return {"status": "Not Found", "message": f"Order {order_id} not found in system."}
+        result = {"status": "Not Found", "message": f"Order {order_id} not found in system."}
+    else:
+        customer_name, sku, quantity, delivery_status = order
+        result = {
+            "status": "Found",
+            "order_id": order_id,
+            "customer_name": customer_name,
+            "current_sku": sku,
+            "current_quantity": quantity,
+            "delivery_status": delivery_status,
+        }
 
-    customer_name, sku, quantity, delivery_status = order
-    return {
-        "status": "Found",
-        "order_id": order_id,
-        "customer_name": customer_name,
-        "current_sku": sku,
-        "current_quantity": quantity,
-        "delivery_status": delivery_status,
-    }
+    cache[order_id] = result
+    return result
 
 
 def _validate_modification(cursor, order_id, mapped_sku, requested_quantity):
@@ -139,6 +173,9 @@ def commit_order_modification(order_id, mapped_sku, requested_quantity):
             (requested_quantity, order_id),
         )
         conn.commit()
+        # The cached get_order_details result for this order is now stale
+        # -- drop it immediately so the next lookup hits the database.
+        _order_cache().pop(order_id, None)
         return {"status": "Success", "message": "Order and inventory successfully reconciled."}
     except Exception as e:
         conn.rollback()

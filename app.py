@@ -96,9 +96,22 @@ DB_SNAPSHOT_MAX_ATTEMPTS = 5  # Azure SQL only -- see get_db_snapshot
 DB_SNAPSHOT_RETRY_DELAY_S = 1.5
 
 
+@st.cache_data(ttl=5)
 def get_db_snapshot():
     """Returns (inventory_df, orders_df, error). error is None on success;
     when set, the sidebar shows it instead of crashing the app.
+
+    Cached for 5s (@st.cache_data(ttl=5)) so the almost-every-rerun nature
+    of Streamlit (button clicks, toggles, dropdown changes) doesn't re-hit
+    the database when nothing has changed -- 5s is short enough that the
+    sidebar is never meaningfully stale, long enough to absorb a burst of
+    reruns from rapid clicking. This cache is only ever read for display;
+    it's never consulted for feasibility checks (check_order_modification
+    always queries live), so a cached snapshot can't cause a wrong
+    approval decision -- only a few-second-old sidebar number. Callers
+    that write to the database (commit_order_modification) must call
+    st.cache_data.clear() right after a successful commit so the sidebar
+    doesn't keep showing the pre-write snapshot for up to 5 more seconds.
 
     Azure SQL gets retried up to DB_SNAPSHOT_MAX_ATTEMPTS times: on a
     Container Apps cold start, the very first request can hit "Login
@@ -224,6 +237,7 @@ with col2:
                             commit_result = commit_order_modification(**verified_change)
                             st.session_state.last_commit_result = commit_result
                             if commit_result.get("status") == "Success":
+                                st.cache_data.clear()  # sidebar shouldn't show the pre-write snapshot
                                 st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
                             else:
                                 st.toast(f"Auto-approve commit failed: {commit_result.get('message')}", icon="⚠️")
@@ -286,6 +300,7 @@ with col2:
                         st.session_state.last_commit_result = commit_result
                         st.session_state.pending_approval = None
                         if commit_result.get("status") == "Success":
+                            st.cache_data.clear()  # sidebar shouldn't show the pre-write snapshot
                             st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
                         else:
                             st.toast(f"Commit failed: {commit_result.get('message')}", icon="⚠️")
