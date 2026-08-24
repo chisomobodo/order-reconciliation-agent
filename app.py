@@ -13,6 +13,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parseaddr
 
 import extra_streamlit_components as stx
 from extra_streamlit_components.CookieManager import _component_func as _cookie_component
@@ -23,6 +24,7 @@ import streamlit as st
 import auth
 import auth_theme
 import email_ingestion
+import outbound_email
 from theme import build_css, email_card_html, step_card_html, stamp_html
 
 st.set_page_config(layout="wide", page_title="Reconciliation Agent", page_icon="📦")
@@ -140,8 +142,17 @@ def _ensure_email_tracking_schema():
     return True
 
 
+@st.cache_resource
+def _ensure_outbound_email_schema():
+    """Same pattern again -- outbound_emails (the send-approval queue)
+    lives in the same database, created once per process."""
+    outbound_email.init_outbound_email_schema(auth_get_connection, is_azure=USE_AZURE_DB)
+    return True
+
+
 _ensure_auth_schema()
 _ensure_email_tracking_schema()
+_ensure_outbound_email_schema()
 
 # --- Session cookie: read side ---
 # CookieManager.get()/get_all() hardcode default={} internally (confirmed
@@ -417,29 +428,49 @@ def _process_pending_email(item):
     st.session_state.pending_approval = None
     st.session_state.last_commit_result = None
 
-    if final_result and final_result.get("status") == "Success":
-        verified_change = find_verified_change(tool_log)
-        if verified_change:
-            if st.session_state.auto_approve:
-                commit_result = commit_order_modification(**verified_change)
-                if commit_result.get("status") == "Success":
-                    st.cache_data.clear()
-                    st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
-                else:
-                    st.toast(f"Auto-approve commit failed: {commit_result.get('message')}", icon="⚠️")
+    verified_change = find_verified_change(tool_log) if tool_log else None
+
+    # Queue the drafted reply for human approval before it's ever sent --
+    # same check/commit-style gate already used for database writes, now
+    # extended to outbound email. Every drafted reply is queued here,
+    # regardless of outcome (a clarification question needs sending just
+    # as much as an order confirmation does). item["sender"] is the raw
+    # "From" header (can be "Display Name <addr>", not a bare address) --
+    # parseaddr() pulls out just the address smtplib actually needs.
+    sender_address = parseaddr(item["sender"])[1] or item["sender"]
+    outbound_email.queue_draft(
+        auth_get_connection,
+        to_email=sender_address,
+        subject=f"Re: {item['subject']}",
+        body=reply,
+        context_note=(
+            f"Order {verified_change['order_id']} — from inbox ({item['sender']})"
+            if verified_change
+            else f"{final_result.get('status') if final_result else 'No Action'} — from inbox ({item['sender']})"
+        ),
+    )
+
+    if final_result and final_result.get("status") == "Success" and verified_change:
+        if st.session_state.auto_approve:
+            commit_result = commit_order_modification(**verified_change)
+            if commit_result.get("status") == "Success":
+                st.cache_data.clear()
+                st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
             else:
-                # Queued, not auto-committed -- a human still needs to
-                # review it. The email is still moved to processed_emails
-                # below regardless: "processed" means the agent has
-                # reached an outcome for it, not that a human has acted
-                # on that outcome yet. Re-fetching the same email on
-                # every future inbox check just because nobody's clicked
-                # Approve yet would be worse, not safer.
-                st.session_state.pending_approval_queue.append({
-                    **verified_change,
-                    "sender": item["sender"],
-                    "subject": item["subject"],
-                })
+                st.toast(f"Auto-approve commit failed: {commit_result.get('message')}", icon="⚠️")
+        else:
+            # Queued, not auto-committed -- a human still needs to
+            # review it. The email is still moved to processed_emails
+            # below regardless: "processed" means the agent has
+            # reached an outcome for it, not that a human has acted
+            # on that outcome yet. Re-fetching the same email on
+            # every future inbox check just because nobody's clicked
+            # Approve yet would be worse, not safer.
+            st.session_state.pending_approval_queue.append({
+                **verified_change,
+                "sender": item["sender"],
+                "subject": item["subject"],
+            })
 
     tool_chain_summary = " -> ".join(call["tool_called"] for call in tool_log) if tool_log else "NONE"
     final_status = final_result.get("status", "?") if final_result else "No Action"
@@ -732,17 +763,29 @@ with col1:
 
         if choice == "-- Write your own --":
             email_body = st.text_area("Email content:", height=200, placeholder="Paste or type a customer email here...")
+            original_subject = "Your Order"
         else:
             idx = options.index(choice) - 1
             email_body = st.text_area("Email content:", value=sample_emails[idx]["body"], height=200)
+            original_subject = sample_emails[idx]["subject"]
     else:
         st.info("No sample_emails.json found — run generate_test_emails.py first for pre-built test cases.")
         email_body = st.text_area("Email content:", height=200, placeholder="Paste or type a customer email here...")
+        original_subject = "Your Order"
+
+    # Manually pasted/typed emails have no "From" header to draw a reply
+    # address from (unlike ingested emails, which do) -- required so the
+    # drafted reply can actually be queued for approval below.
+    sender_email = st.text_input(
+        "Sender's email address:",
+        placeholder="customer@example.com",
+        key="manual_sender_email",
+    )
 
     run_clicked = st.button(
         "Process with Agent",
         type="primary",
-        disabled=not email_body.strip() or bool(DB_INIT_ERROR),
+        disabled=not email_body.strip() or not sender_email.strip() or bool(DB_INIT_ERROR),
     )
 
 with col2:
@@ -765,20 +808,38 @@ with col2:
                 st.session_state.pending_approval = None
                 st.session_state.last_commit_result = None
 
-                if final_result and final_result.get("status") == "Success":
-                    verified_change = find_verified_change(tool_log)
-                    if verified_change:
-                        if st.session_state.auto_approve:
-                            commit_result = commit_order_modification(**verified_change)
-                            st.session_state.last_commit_result = commit_result
-                            if commit_result.get("status") == "Success":
-                                st.cache_data.clear()  # sidebar shouldn't show the pre-write snapshot
-                                st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
-                            else:
-                                st.toast(f"Auto-approve commit failed: {commit_result.get('message')}", icon="⚠️")
+                verified_change = find_verified_change(tool_log) if tool_log else None
+
+                # Queue the drafted reply for human approval before it's
+                # ever sent -- same check/commit-style gate already used
+                # for database writes, now extended to outbound email.
+                # This must run BEFORE the st.rerun() below (which only
+                # fires for a verified change), so it happens for every
+                # outcome -- including a clarification question, which
+                # still needs to reach the customer.
+                outbound_email.queue_draft(
+                    auth_get_connection,
+                    to_email=sender_email.strip(),
+                    subject=f"Re: {original_subject}",
+                    body=reply,
+                    context_note=(
+                        f"Order {verified_change['order_id']}" if verified_change
+                        else (final_result.get("status") if final_result else "No Action")
+                    ),
+                )
+
+                if final_result and final_result.get("status") == "Success" and verified_change:
+                    if st.session_state.auto_approve:
+                        commit_result = commit_order_modification(**verified_change)
+                        st.session_state.last_commit_result = commit_result
+                        if commit_result.get("status") == "Success":
+                            st.cache_data.clear()  # sidebar shouldn't show the pre-write snapshot
+                            st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
                         else:
-                            st.session_state.pending_approval = verified_change
-                        st.rerun()
+                            st.toast(f"Auto-approve commit failed: {commit_result.get('message')}", icon="⚠️")
+                    else:
+                        st.session_state.pending_approval = verified_change
+                    st.rerun()
             except Exception as e:
                 st.session_state.last_result = {"error": str(e)}
 
@@ -857,6 +918,41 @@ with col2:
     if not run_clicked and "last_result" not in st.session_state:
         st.info("Select or write an email on the left, then click **Process with Agent**.")
 
+    st.divider()
+    st.markdown("**📤 Pending Outbound Emails**")
+    st.caption("Every drafted reply is queued here for approval before it's ever sent -- same gate as a database write.")
+    pending_drafts = outbound_email.get_pending_drafts(auth_get_connection)
+    if pending_drafts:
+        for draft in pending_drafts:
+            st.markdown(stamp_html("Pending Approval"), unsafe_allow_html=True)
+            st.markdown(
+                f"""<div class="reply-card">
+                To: <b>{html.escape(draft['to_email'])}</b><br>
+                Subject: <b>{html.escape(draft['subject'])}</b><br><br>
+                {draft['body']}
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            if draft.get("context_note"):
+                st.caption(f"Context: {draft['context_note']}")
+            approve_email_col, reject_email_col = st.columns(2)
+            with approve_email_col:
+                if st.button("✅ Approve & Send", type="primary", use_container_width=True, key=f"approve_email_{draft['id']}"):
+                    send_result = outbound_email.approve_and_send(auth_get_connection, draft["id"])
+                    if send_result.get("status") == "Sent":
+                        st.toast(send_result.get("message", "Email sent."), icon="📧")
+                    else:
+                        st.toast(f"Send failed: {send_result.get('message')}", icon="⚠️")
+                    st.rerun()
+            with reject_email_col:
+                if st.button("❌ Reject", use_container_width=True, key=f"reject_email_{draft['id']}"):
+                    outbound_email.reject_draft(auth_get_connection, draft["id"])
+                    st.toast("Draft discarded — not sent.", icon="🚫")
+                    st.rerun()
+            st.divider()
+    else:
+        st.caption("No outbound emails currently pending approval.")
+
 # --- Sidebar: live ERP ledger ---
 # Rendered last, after the header/CSS/toggles and the main email/agent
 # panel are already fully sent to the browser. get_db_snapshot() can block
@@ -888,3 +984,13 @@ with st.sidebar:
         st.dataframe(processed_df, use_container_width=True, hide_index=True)
     else:
         st.caption("No emails processed yet.")
+
+    st.header("Sent Emails")
+    st.caption("Permanent audit log of every outbound email actually sent -- nothing here was sent without an explicit Approve & Send click.")
+    sent_log = outbound_email.get_sent_log(auth_get_connection)
+    if sent_log:
+        sent_df = pd.DataFrame(sent_log)[["to_email", "subject", "sent_at"]]
+        sent_df.columns = ["Recipient", "Subject", "Sent At"]
+        st.dataframe(sent_df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No emails sent yet.")
