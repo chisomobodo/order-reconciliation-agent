@@ -50,6 +50,12 @@ are invented.
 - [x] Caching — the sidebar's ERP snapshot (`@st.cache_data(ttl=5)`) and
       per-session `get_order_details` lookups, both invalidated exactly
       at the point a write actually commits (see "Design notes" below)
+- [x] Real email ingestion (`email_ingestion.py`) — a "Check Inbox for New
+      Orders" button fetches unread emails from a dedicated Gmail label
+      via IMAP and lists them for review; a human then chooses which to
+      run (individually, or all at once) through the identical
+      `run_agent()` pipeline as a manually pasted email — same tool-call
+      display, same approval-gate flow; see "Email Ingestion" below
 
 ## How it works
 
@@ -81,6 +87,7 @@ app.py                        Streamlit dashboard
 theme.py                       Design system (shipping-manifest aesthetic, stamp badges)
 auth.py                         Login/sign-up backend (bcrypt + emailed code + sessions)
 auth_theme.py                    Login/sign-up screen design, restyled in the app's palette
+email_ingestion.py                Real IMAP ingestion of customer emails from a Gmail label
 setup_db.py                     Mock ERP schema + seed data (SQLite)
 setup_db_azure.py                Mock ERP schema + seed data (Azure SQL)
 generate_test_emails.py           Generates sample_emails.json via Claude
@@ -182,6 +189,53 @@ box around the code-entry step's buttons). All fields go through
 `st.form`/`st.form_submit_button` so Enter submits a whole group at once.
 See "Design notes" below for the session-cookie reliability work, which
 was the more substantial fix in this area.
+
+### Email Ingestion
+
+The **📥 Check Inbox for New Orders** button (`email_ingestion.py`) is
+two steps, not one:
+
+1. **Fetch and review.** Clicking it pulls real, unread customer emails
+   over IMAP from a dedicated Gmail label — scoped deliberately to that
+   one label, never the whole inbox, so the agent can never see or
+   process personal email — and inserts any not already known (deduped
+   by uid) into a `pending_emails` table. The pending list shown on
+   screen is queried fresh from that table on every render, not from
+   session state, so it's correct regardless of which browser session
+   did the fetching and survives a page refresh. Clicking Check Inbox
+   repeatedly is always safe: the dedup means it can never duplicate an
+   email still pending or resurrect one already processed. Nothing runs
+   through the agent yet, and nothing is marked read in Gmail yet.
+2. **Choose what to process.** A **Process** button on each card handles
+   just that email; **▶️ Process All** works through the whole list, one
+   at a time. Either way, an email only runs through the exact same
+   `run_agent()` pipeline as a manually pasted one once a human triggers
+   it — same tool-call chain, same approval-gate logic. Its result also
+   replaces whatever the "Agent Execution" panel was showing (the same
+   single-result display used for manually pasted emails, not a growing
+   list — the panel always shows only the most recently processed
+   email). On success, the email moves from `pending_emails` to a
+   `processed_emails` table (with a timestamp, tool-chain summary, and
+   final status) and is marked read in Gmail (`mark_processed`) — both
+   immediately after that specific email's own processing, not batched
+   at the end. If `run_agent()` itself raises, the email is left in
+   `pending_emails` and never marked read, so it's retried on the next
+   check instead of silently lost. A **Processed Emails** log in the
+   sidebar shows the full `processed_emails` history (sender, subject,
+   status, timestamp) as a standing reference, viewable anytime.
+
+Reuses `GMAIL_ADDRESS` / `GMAIL_APP_PASSWORD` from "Login &
+Authentication" above (Gmail App Passwords work for both sending, via
+SMTP, and reading, via IMAP) — no separate credential needed. One more
+optional env var:
+
+```bash
+export IMAP_LABEL=OrderRequests  # optional -- this is the default
+```
+
+One-time setup in Gmail itself (not code): create a label (e.g.
+`OrderRequests`) and route or manually apply it to whichever emails
+should be treated as customer order-change requests.
 
 ## Docker & Deployment
 
@@ -292,10 +346,30 @@ Feasibility checks (`check_order_modification`) are never cached, only
 ever queried live, so a stale cache can never be the reason an approval
 decision is wrong — only the reason a *display* is a few seconds behind.
 
+**"Processed" vs "approved" (`email_ingestion.py`, `app.py`).**
+Fetching and processing are deliberately two separate steps — "Check
+Inbox" only lists what's there; nothing runs through the agent or gets
+marked read until a human clicks Process (or Process All) — so a
+customer's actual wording is visible before anything acts on it.
+`mark_processed(uid)` is then called once `run_agent()` has reached an
+outcome for that specific email — auto-committed, queued for manual
+approval, or no action needed — not once a human has actually clicked
+Approve on the result. A batch of ingested emails can produce several items that each
+need independent manual review, so they go into a list
+(`pending_approval_queue`) rather than the single `pending_approval` slot
+the manual-paste flow uses, and are shown one at a time with the same
+card/stamp styling; marking each email read as soon as the agent's part
+of the work is done means a still-undecided approval lives in the app's
+own state, not in the inbox — the same email is never re-fetched and
+re-run through the agent on a later check just because nobody's clicked
+Approve yet. An email is deliberately left unread (not marked processed)
+if `run_agent()` itself raises, so a transient failure (e.g. a dropped
+Claude API call) gets retried on the next check instead of silently
+losing that email.
+
 ## Limitations & Production Considerations
 
 This is a prototype, not a production system:
 
-- No real email ingestion pipeline — emails are pasted or selected in the UI, not received via IMAP/webhook
 - No real ERP integration — the "ERP" is a mock schema seeded with invented data
 - Product catalog is a hardcoded SKU list in `agent_config.py`'s tool schema, not a real product-catalog lookup

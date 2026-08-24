@@ -296,6 +296,21 @@ def step_card_html(index: int, tool_name: str, status: str, detail: str, delay_s
     """
 
 
+def email_card_html(index: int, sender: str, subject: str, preview: str, delay_s: float) -> str:
+    """Same .step-card visual styling as step_card_html, adapted for
+    listing a fetched-but-not-yet-processed inbox email instead of a
+    tool call. Callers must HTML-escape sender/subject/preview first --
+    unlike step_card_html's fields, these come from real external email
+    content, not from the agent's own structured output."""
+    return f"""
+    <div class="step-card" style="animation-delay: {delay_s}s;">
+        <div class="step-label">Email {index} · From {sender}</div>
+        <div class="step-tool">{subject}</div>
+        <div class="step-detail">{preview}</div>
+    </div>
+    """
+
+
 def stamp_html(status: str) -> str:
     variant = {
         "Success": "stamp-success",

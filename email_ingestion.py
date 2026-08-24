@@ -1,0 +1,343 @@
+"""
+Real IMAP email ingestion for the Reconciliation Agent.
+
+Connects to Gmail via IMAP, fetches unread emails under a specific
+label (NOT the whole inbox -- scoped deliberately so the agent never
+sees or processes personal email), parses sender/subject/body, and
+marks them processed afterward so they aren't re-ingested.
+
+Reuses the same GMAIL_ADDRESS / GMAIL_APP_PASSWORD environment
+variables already used for sending login codes -- Gmail App Passwords
+work for both SMTP (sending) and IMAP (reading).
+
+Setup required (one-time, in Gmail's own settings, not code):
+  1. Create a Gmail label, e.g. "OrderRequests".
+  2. Route or manually apply that label to whichever emails should be
+     treated as customer order-change requests.
+  3. Set IMAP_LABEL below (or via env var) to match.
+
+This module only fetches and marks messages -- it does not decide
+what to do with them. The caller (app.py) is expected to run each
+parsed email through the exact same run_agent() pipeline as manually
+typed/pasted emails, so the approval-gate design is untouched.
+"""
+import email
+import email.message  # for the email.message.Message annotation below --
+                       # not otherwise guaranteed to be populated as an
+                       # attribute of `email` by a bare `import email`;
+                       # this module currently only works when something
+                       # imported earlier (e.g. auth.py's email.mime
+                       # imports) happens to pull it in first
+import imaplib
+import os
+from datetime import datetime, timezone
+from email.header import decode_header
+
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+IMAP_LABEL = os.environ.get("IMAP_LABEL", "OrderRequests")
+
+IMAP_HOST = "imap.gmail.com"
+
+
+# ---------------------------------------------------------------------
+# Schema (call once at app startup, alongside auth.init_auth_schema --
+# same get_connection()/is_azure pattern, same database)
+# ---------------------------------------------------------------------
+
+SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pending_emails (
+    uid TEXT PRIMARY KEY,
+    sender TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS processed_emails (
+    uid TEXT PRIMARY KEY,
+    sender TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    tool_chain_summary TEXT,
+    final_status TEXT,
+    reply_text TEXT,
+    processed_at TEXT NOT NULL
+);
+"""
+
+AZURE_SQL_SCHEMA = """
+IF OBJECT_ID('pending_emails', 'U') IS NULL
+CREATE TABLE pending_emails (
+    uid NVARCHAR(255) PRIMARY KEY,
+    sender NVARCHAR(500) NOT NULL,
+    subject NVARCHAR(998) NOT NULL,
+    body NVARCHAR(MAX) NOT NULL,
+    fetched_at DATETIME2 NOT NULL
+);
+
+IF OBJECT_ID('processed_emails', 'U') IS NULL
+CREATE TABLE processed_emails (
+    uid NVARCHAR(255) PRIMARY KEY,
+    sender NVARCHAR(500) NOT NULL,
+    subject NVARCHAR(998) NOT NULL,
+    body NVARCHAR(MAX) NOT NULL,
+    tool_chain_summary NVARCHAR(MAX),
+    final_status NVARCHAR(100),
+    reply_text NVARCHAR(MAX),
+    processed_at DATETIME2 NOT NULL
+);
+"""
+
+
+def init_email_tracking_schema(get_connection, is_azure: bool):
+    """Creates the pending_emails/processed_emails tables if they don't
+    exist. Call this once alongside auth.init_auth_schema."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    schema = AZURE_SQL_SCHEMA if is_azure else SQLITE_SCHEMA
+    if is_azure:
+        # Azure SQL doesn't support multiple statements separated by ';'
+        # in one execute() the way sqlite3 does -- split and run each.
+        for statement in schema.split(";"):
+            if statement.strip():
+                cursor.execute(statement)
+    else:
+        cursor.executescript(schema)
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------
+# Pending / processed email tracking
+# ---------------------------------------------------------------------
+
+def sync_fetched_emails(get_connection, fetched: list[dict]) -> int:
+    """Inserts each newly-fetched email into pending_emails, skipping
+    any uid already present in EITHER pending_emails or processed_emails.
+    That dedup is what makes "Check Inbox" always safe to click
+    repeatedly -- it can never duplicate an email still awaiting
+    processing, and can never resurrect one already processed. Returns
+    the number of genuinely new emails inserted."""
+    if not fetched:
+        return 0
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    inserted = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    for item in fetched:
+        cursor.execute("SELECT 1 FROM pending_emails WHERE uid = ?", (item["uid"],))
+        if cursor.fetchone():
+            continue
+        cursor.execute("SELECT 1 FROM processed_emails WHERE uid = ?", (item["uid"],))
+        if cursor.fetchone():
+            continue
+        cursor.execute(
+            "INSERT INTO pending_emails (uid, sender, subject, body, fetched_at) VALUES (?, ?, ?, ?, ?)",
+            (item["uid"], item["sender"], item["subject"], item["body"], now),
+        )
+        inserted += 1
+
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def get_pending_emails(get_connection) -> list[dict]:
+    """Returns the current pending_emails contents, oldest fetched
+    first -- queried fresh from the database every call, not cached, so
+    it's correct regardless of which browser session originally fetched
+    an email and survives a page refresh."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT uid, sender, subject, body, fetched_at FROM pending_emails ORDER BY fetched_at")
+    rows = cursor.fetchall()
+    conn.close()
+    return [
+        {"uid": r[0], "sender": r[1], "subject": r[2], "body": r[3], "fetched_at": r[4]}
+        for r in rows
+    ]
+
+
+def get_processed_emails(get_connection) -> list[dict]:
+    """Returns the processed_emails log, most recently processed first."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT uid, sender, subject, final_status, processed_at FROM processed_emails "
+        "ORDER BY processed_at DESC"
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [
+        {"uid": r[0], "sender": r[1], "subject": r[2], "final_status": r[3], "processed_at": r[4]}
+        for r in rows
+    ]
+
+
+def record_processed_email(
+    get_connection,
+    uid: str,
+    sender: str,
+    subject: str,
+    body: str,
+    tool_chain_summary: str,
+    final_status: str,
+    reply_text: str,
+):
+    """Moves an email from pending_emails to processed_emails: inserts
+    the outcome into processed_emails (with the current timestamp), then
+    deletes the pending_emails row. Does NOT touch Gmail -- call
+    mark_processed(uid) separately; keeping the DB move and the IMAP
+    flag as two explicit steps mirrors how commit_order_modification and
+    email_ingestion.mark_processed are already kept as separate,
+    deliberate actions elsewhere in this project."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor.execute(
+        "INSERT INTO processed_emails "
+        "(uid, sender, subject, body, tool_chain_summary, final_status, reply_text, processed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (uid, sender, subject, body, tool_chain_summary, final_status, reply_text, now),
+    )
+    cursor.execute("DELETE FROM pending_emails WHERE uid = ?", (uid,))
+    conn.commit()
+    conn.close()
+
+
+def _decode_mime_words(value: str) -> str:
+    """Email subjects/names can be MIME-encoded (e.g. '=?UTF-8?B?...?=');
+    decode to a plain readable string."""
+    decoded_parts = decode_header(value)
+    result = ""
+    for part, encoding in decoded_parts:
+        if isinstance(part, bytes):
+            result += part.decode(encoding or "utf-8", errors="replace")
+        else:
+            result += part
+    return result
+
+
+def _extract_body(msg: email.message.Message) -> str:
+    """Handles both plain-text and multipart emails, preferring the
+    plain-text part over HTML."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition", ""))
+            if content_type == "text/plain" and "attachment" not in content_disposition:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    return payload.decode(charset, errors="replace").strip()
+        # Fall back to HTML if no plain-text part exists.
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    return payload.decode(charset, errors="replace").strip()
+        return ""
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            return payload.decode(charset, errors="replace").strip()
+        return ""
+
+
+def fetch_new_order_emails() -> list[dict]:
+    """Connects to Gmail via IMAP, fetches UNSEEN emails under
+    IMAP_LABEL, and returns them as a list of dicts:
+    [{"uid": ..., "sender": ..., "subject": ..., "body": ...}, ...]
+
+    Does NOT mark anything as read/processed -- call mark_processed()
+    per-email after it's actually been run through the agent, so a
+    crash mid-batch doesn't silently lose/skip an email.
+    """
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        raise RuntimeError(
+            "GMAIL_ADDRESS and GMAIL_APP_PASSWORD must be set to use email ingestion."
+        )
+
+    results = []
+    conn = imaplib.IMAP4_SSL(IMAP_HOST)
+    try:
+        conn.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+
+        # Gmail exposes labels as IMAP folders. A label with a space
+        # needs quoting. readonly=True: this function never writes
+        # anything (mark_processed() does that, on its own separate
+        # connection) -- opening read-only is a second, independent
+        # guarantee against any flag getting mutated as a side effect of
+        # a fetch here, on top of using BODY.PEEK[] below.
+        status, _ = conn.select(f'"{IMAP_LABEL}"', readonly=True)
+        if status != "OK":
+            raise RuntimeError(
+                f"Could not open Gmail label '{IMAP_LABEL}'. "
+                f"Create this label in Gmail first, or set IMAP_LABEL to an existing one."
+            )
+
+        status, data = conn.search(None, "UNSEEN")
+        if status != "OK":
+            return []
+
+        uids = data[0].split()
+
+        for uid in uids:
+            # BODY.PEEK[], not RFC822 -- RFC822 (and plain BODY[]) fetch
+            # the full message but implicitly set \Seen as a side effect
+            # of the fetch itself (RFC 3501 SS6.4.5), even though this
+            # function never calls STORE. That silently marked every
+            # fetched email as read the moment "Check Inbox" ran, whether
+            # or not it was ever actually processed -- so an unprocessed
+            # email would vanish on the next check instead of still
+            # showing up. PEEK reads the identical content without that
+            # side effect; only mark_processed()'s explicit +FLAGS \Seen
+            # call below should ever mark an email read.
+            status, msg_data = conn.fetch(uid, "(BODY.PEEK[])")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+
+            sender = _decode_mime_words(msg.get("From", ""))
+            subject = _decode_mime_words(msg.get("Subject", "(no subject)"))
+            body = _extract_body(msg)
+
+            results.append({
+                "uid": uid.decode() if isinstance(uid, bytes) else uid,
+                "sender": sender,
+                "subject": subject,
+                "body": body,
+            })
+
+        return results
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn.logout()
+
+
+def mark_processed(uid: str):
+    """Marks a single email as read (Seen) so it isn't fetched again
+    on the next check. Call this AFTER the email has actually been
+    run through the agent -- not before -- so a mid-process crash
+    doesn't cause the email to be silently skipped forever."""
+    conn = imaplib.IMAP4_SSL(IMAP_HOST)
+    try:
+        conn.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        conn.select(f'"{IMAP_LABEL}"', readonly=False)
+        conn.store(uid, "+FLAGS", "\\Seen")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn.logout()

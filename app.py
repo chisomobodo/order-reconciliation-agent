@@ -8,6 +8,7 @@ generic analytics-dashboard skin.
 
 Run with: streamlit run app.py
 """
+import html
 import json
 import os
 import time
@@ -21,7 +22,8 @@ import streamlit as st
 
 import auth
 import auth_theme
-from theme import build_css, step_card_html, stamp_html
+import email_ingestion
+from theme import build_css, email_card_html, step_card_html, stamp_html
 
 st.set_page_config(layout="wide", page_title="Reconciliation Agent", page_icon="📦")
 
@@ -81,6 +83,25 @@ if "pending_approval" not in st.session_state:
 if "last_commit_result" not in st.session_state:
     st.session_state.last_commit_result = None
 
+# --- Inbox-ingestion state ---
+# Fetched-but-unprocessed emails now live in the pending_emails DB table
+# (see email_ingestion.sync_fetched_emails/get_pending_emails), not
+# session state -- queried fresh on every render, so the pending list is
+# correct regardless of which browser session fetched an email and
+# survives a page refresh. Only the fetch-time error itself is transient
+# session state (it needs to survive the st.rerun() right after a failed
+# "Check Inbox" click, but has no reason to persist beyond that).
+# pending_approval_queue is a LIST rather than the single pending_approval
+# slot the manual-paste flow uses above -- several ingested emails can
+# each independently need a human decision, and overwriting a single slot
+# per new item would silently drop the earlier ones without ever letting
+# a human review them. Rendered one at a time (same card/stamp styling as
+# the single-item flow), popped as each is decided.
+if "fetch_error" not in st.session_state:
+    st.session_state.fetch_error = None
+if "pending_approval_queue" not in st.session_state:
+    st.session_state.pending_approval_queue = []
+
 st.markdown(build_css(st.session_state.theme), unsafe_allow_html=True)
 
 # --- Auth gate ---
@@ -111,7 +132,16 @@ def _ensure_auth_schema():
     return True
 
 
+@st.cache_resource
+def _ensure_email_tracking_schema():
+    """Same pattern as _ensure_auth_schema -- pending_emails/
+    processed_emails live in the same database, created once per process."""
+    email_ingestion.init_email_tracking_schema(auth_get_connection, is_azure=USE_AZURE_DB)
+    return True
+
+
 _ensure_auth_schema()
+_ensure_email_tracking_schema()
 
 # --- Session cookie: read side ---
 # CookieManager.get()/get_all() hardcode default={} internally (confirmed
@@ -354,6 +384,79 @@ def find_verified_change(tool_log):
     return None
 
 
+def _process_pending_email(item):
+    """Runs one pending inbox email (a dict from email_ingestion.
+    get_pending_emails) through the exact same run_agent() pipeline as a
+    manually pasted email -- same approval-gate handling (auto-commit, or
+    queued for manual review). Updates st.session_state.last_result with
+    the outcome, so the "Agent Execution" panel shows this result in
+    place of whatever was there before (the same single-result pattern
+    used before ingestion was added -- not an accumulating list, whether
+    triggered by the per-email "Process" button or by "Process All"
+    working through several in a row).
+
+    On success, moves the email from pending_emails to processed_emails
+    in the database (email_ingestion.record_processed_email) and marks
+    it processed in Gmail. If run_agent() itself raises, the email is
+    deliberately left in pending_emails and never marked processed in
+    Gmail, so it's retried on the next inbox check rather than silently
+    lost to a transient failure (e.g. a dropped Claude API call)."""
+    try:
+        tool_log, final_result, reply = run_agent(item["body"])
+    except Exception as e:
+        st.session_state.last_result = {"error": str(e)}
+        return
+
+    st.session_state.last_result = {
+        "tool_log": tool_log,
+        "final_result": final_result,
+        "reply": reply,
+    }
+    # A freshly processed email supersedes whatever manual-paste approval
+    # state was left over -- both sources share this one display panel.
+    st.session_state.pending_approval = None
+    st.session_state.last_commit_result = None
+
+    if final_result and final_result.get("status") == "Success":
+        verified_change = find_verified_change(tool_log)
+        if verified_change:
+            if st.session_state.auto_approve:
+                commit_result = commit_order_modification(**verified_change)
+                if commit_result.get("status") == "Success":
+                    st.cache_data.clear()
+                    st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
+                else:
+                    st.toast(f"Auto-approve commit failed: {commit_result.get('message')}", icon="⚠️")
+            else:
+                # Queued, not auto-committed -- a human still needs to
+                # review it. The email is still moved to processed_emails
+                # below regardless: "processed" means the agent has
+                # reached an outcome for it, not that a human has acted
+                # on that outcome yet. Re-fetching the same email on
+                # every future inbox check just because nobody's clicked
+                # Approve yet would be worse, not safer.
+                st.session_state.pending_approval_queue.append({
+                    **verified_change,
+                    "sender": item["sender"],
+                    "subject": item["subject"],
+                })
+
+    tool_chain_summary = " -> ".join(call["tool_called"] for call in tool_log) if tool_log else "NONE"
+    final_status = final_result.get("status", "?") if final_result else "No Action"
+
+    email_ingestion.record_processed_email(
+        auth_get_connection,
+        uid=item["uid"],
+        sender=item["sender"],
+        subject=item["subject"],
+        body=item["body"],
+        tool_chain_summary=tool_chain_summary,
+        final_status=final_status,
+        reply_text=reply,
+    )
+    email_ingestion.mark_processed(item["uid"])
+
+
 def db_mode_badge_html(mode: str, has_error: bool) -> str:
     """Small stamp badge for the header showing which DB backend is live.
     Reuses the existing .stamp CSS classes from theme.py rather than
@@ -499,6 +602,125 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("Inbound Email")
+
+    st.caption(f"Real customer emails, pulled from Gmail's \"{email_ingestion.IMAP_LABEL}\" label.")
+    check_inbox_clicked = st.button(
+        "📥 Check Inbox for New Orders",
+        type="secondary",
+        use_container_width=True,
+        disabled=bool(DB_INIT_ERROR),
+    )
+
+    if check_inbox_clicked:
+        # Fetch, then sync into the pending_emails table (deduped by
+        # uid against both pending_emails and processed_emails) -- never
+        # runs anything through the agent or marks anything processed in
+        # Gmail. That only happens once a human explicitly clicks
+        # Process / Process All below, so they can see what was found
+        # before anything acts on it. Safe to click repeatedly: syncing
+        # can never duplicate an email still pending, or resurrect one
+        # already processed.
+        with st.spinner("Checking inbox..."):
+            try:
+                fetched = email_ingestion.fetch_new_order_emails()
+            except Exception as e:
+                st.session_state.fetch_error = str(e)
+            else:
+                st.session_state.fetch_error = None
+                inserted = email_ingestion.sync_fetched_emails(auth_get_connection, fetched)
+                st.toast(
+                    f"Found {inserted} new email(s)." if inserted else "No new emails found.",
+                    icon="📥",
+                )
+        st.rerun()
+
+    if st.session_state.fetch_error:
+        st.error(f"Could not check inbox: {st.session_state.fetch_error}")
+
+    # Queried fresh from the database on every render, not session state
+    # -- correct regardless of which browser session originally fetched
+    # an email, and survives a page refresh.
+    pending_emails = email_ingestion.get_pending_emails(auth_get_connection)
+
+    if pending_emails:
+        st.markdown(f"**{len(pending_emails)} email(s) pending processing:**")
+        process_all_clicked = st.button(
+            "▶️ Process All",
+            type="primary",
+            use_container_width=True,
+            key="process_all_ingested",
+        )
+
+        process_this_uid = None
+        for i, item in enumerate(pending_emails, 1):
+            preview = item["body"][:300] + ("…" if len(item["body"]) > 300 else "")
+            st.markdown(
+                email_card_html(
+                    i,
+                    html.escape(item["sender"]),
+                    html.escape(item["subject"]),
+                    html.escape(preview),
+                    delay_s=(i - 1) * 0.08,
+                ),
+                unsafe_allow_html=True,
+            )
+            if st.button("Process", key=f"process_ingested_{item['uid']}"):
+                process_this_uid = item["uid"]
+
+        # Only one of these can actually be true on any given run --
+        # Streamlit only reports a click for the specific widget that was
+        # clicked -- so there's no risk of double-processing here.
+        if process_all_clicked:
+            for item in pending_emails:
+                _process_pending_email(item)
+            st.rerun()
+        elif process_this_uid:
+            item = next(e for e in pending_emails if e["uid"] == process_this_uid)
+            _process_pending_email(item)
+            st.rerun()
+    else:
+        st.caption("No emails currently pending processing.")
+
+    if st.session_state.pending_approval_queue:
+        pending = st.session_state.pending_approval_queue[0]
+        remaining = len(st.session_state.pending_approval_queue)
+        label = "**Database Write — from inbox**"
+        if remaining > 1:
+            label += f" ({remaining} awaiting review)"
+        st.markdown(label)
+        st.markdown(stamp_html("Pending Approval"), unsafe_allow_html=True)
+        st.markdown(
+            f"""<div class="reply-card">
+            From: <b>{html.escape(pending['sender'])}</b><br>
+            Subject: <b>{html.escape(pending['subject'])}</b><br>
+            Order: <b>{pending['order_id']}</b><br>
+            SKU: <b>{pending['mapped_sku']}</b><br>
+            New quantity: <b>{pending['requested_quantity']}</b>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        ingest_approve_col, ingest_reject_col = st.columns(2)
+        with ingest_approve_col:
+            if st.button("✅ Approve & Apply", type="primary", use_container_width=True, key="ingest_approve"):
+                commit_result = commit_order_modification(
+                    order_id=pending["order_id"],
+                    mapped_sku=pending["mapped_sku"],
+                    requested_quantity=pending["requested_quantity"],
+                )
+                st.session_state.pending_approval_queue.pop(0)
+                if commit_result.get("status") == "Success":
+                    st.cache_data.clear()
+                    st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
+                else:
+                    st.toast(f"Commit failed: {commit_result.get('message')}", icon="⚠️")
+                st.rerun()
+        with ingest_reject_col:
+            if st.button("❌ Reject", use_container_width=True, key="ingest_reject"):
+                st.session_state.pending_approval_queue.pop(0)
+                st.toast("Change discarded.", icon="🚫")
+                st.rerun()
+
+    st.divider()
 
     sample_emails = load_sample_emails()
 
@@ -656,3 +878,13 @@ with st.sidebar:
         st.subheader("Orders")
         st.dataframe(ords, use_container_width=True, hide_index=True)
     st.caption(f"Backend: {DB_MODE}. Refreshes automatically after each successful reconciliation.")
+
+    st.header("Processed Emails")
+    st.caption("Reference log of every inbox email run through the agent -- viewable anytime, not just right after processing.")
+    processed_emails = email_ingestion.get_processed_emails(auth_get_connection)
+    if processed_emails:
+        processed_df = pd.DataFrame(processed_emails)[["sender", "subject", "final_status", "processed_at"]]
+        processed_df.columns = ["Sender", "Subject", "Status", "Processed At"]
+        st.dataframe(processed_df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No emails processed yet.")
