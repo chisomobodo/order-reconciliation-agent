@@ -43,6 +43,13 @@ are invented.
       graceful (non-crashing) error path if the connection isn't configured
 - [x] Containerized with Docker and deployed to Azure Container Apps,
       backed by Azure SQL Database (see "Docker & Deployment" below)
+- [x] Login/sign-up with email-code two-factor auth (`auth.py`, styled by
+      `auth_theme.py`) — gates the entire dashboard behind a session,
+      hardened against real cookie-timing races (see "Login &
+      Authentication" and "Design notes" below)
+- [x] Caching — the sidebar's ERP snapshot (`@st.cache_data(ttl=5)`) and
+      per-session `get_order_details` lookups, both invalidated exactly
+      at the point a write actually commits (see "Design notes" below)
 
 ## How it works
 
@@ -72,6 +79,8 @@ agent_engine.py             Orchestration loop, SQLite backend
 agent_engine_azure.py        Orchestration loop, Azure SQL backend (pyodbc)
 app.py                        Streamlit dashboard
 theme.py                       Design system (shipping-manifest aesthetic, stamp badges)
+auth.py                         Login/sign-up backend (bcrypt + emailed code + sessions)
+auth_theme.py                    Login/sign-up screen design, restyled in the app's palette
 setup_db.py                     Mock ERP schema + seed data (SQLite)
 setup_db_azure.py                Mock ERP schema + seed data (Azure SQL)
 generate_test_emails.py           Generates sample_emails.json via Claude
@@ -133,6 +142,46 @@ Then launch the dashboard with `USE_AZURE_DB=true` set. The header shows a
 badge for whichever backend is active. If `USE_AZURE_DB=true` but the driver
 or env vars are missing, `app.py` shows a connection error in the UI rather
 than crashing — it does not fall back to SQLite automatically.
+
+### Login & Authentication
+
+The dashboard is gated behind login/sign-up (`auth.py`, styled by
+`auth_theme.py`) — nothing else renders until there's a valid session.
+Flow: sign up with email + password (bcrypt-hashed, never stored in
+plaintext) → log in with password → a 6-digit code is emailed and must be
+entered within 10 minutes → a session cookie is issued, valid for 20
+minutes of inactivity (sliding window; any interaction refreshes it).
+
+Sending the code requires a Gmail account with an **App Password** (not
+the account's normal password):
+
+```bash
+export GMAIL_ADDRESS=youraddress@gmail.com
+export GMAIL_APP_PASSWORD=your_16_char_app_password
+```
+
+To generate one:
+1. Enable 2-Step Verification on the Gmail account, if not already on:
+   [myaccount.google.com/security](https://myaccount.google.com/security)
+2. Go to [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+3. Create an app password (any name, e.g. "Reconciliation Agent") and copy
+   the 16-character code it generates — that's `GMAIL_APP_PASSWORD`, not
+   the Gmail login password.
+
+The `users` / `login_codes` / `sessions` tables are created automatically
+on first run (`auth.init_auth_schema`, called once per process at
+startup), in whichever database `USE_AZURE_DB` currently points at — no
+separate setup script needed.
+
+The login/sign-up screen (`auth_theme.py`) is styled directly on
+Streamlit's own DOM (`stHorizontalBlock`/`stColumn`/`stTextInputRootElement`)
+rather than hand-written wrapper `<div>`s, since the latter doesn't
+actually nest around real Streamlit elements and was causing real layout
+bugs (a collapsed/blank screen, a stray border seam, an oversized empty
+box around the code-entry step's buttons). All fields go through
+`st.form`/`st.form_submit_button` so Enter submits a whole group at once.
+See "Design notes" below for the session-cookie reliability work, which
+was the more substantial fix in this area.
 
 ## Docker & Deployment
 
@@ -197,6 +246,51 @@ or premature tool call could silently mutate the ERP.
 contract and approval-gate split, so `app.py` can switch between them via
 `USE_AZURE_DB` without changing any agent logic — fast local iteration day
 to day, with a working cloud version to demo when needed.
+
+**Email-code login (`auth.py`).** Password alone is one factor; the emailed
+code is a genuine second one, not just a re-check of something already
+known. Sessions use a sliding inactivity window rather than a fixed expiry
+so an active user is never logged out mid-task, but an abandoned tab
+still expires. The session token lives in a browser cookie (via
+`extra-streamlit-components`) so a page reload doesn't require logging in
+again, but the server re-validates it — and refreshes the window — on
+every single rerun, not just once at load.
+
+**Session cookie reliability (`app.py`).** `extra-streamlit-components`
+wraps a browser-side custom component, and its public API
+(`CookieManager.get()`/`get_all()`) hardcodes a `default={}` fallback —
+making "the component's browser round-trip hasn't finished yet"
+indistinguishable from "it finished, and there's genuinely no cookie."
+That ambiguity was causing a hard refresh to occasionally log a
+genuinely-valid session out. The fix reads the same underlying component
+call directly with our own sentinel default (`None`) instead, so the two
+cases can actually be told apart; if unresolved, it retries with a real
+`time.sleep()` between attempts (bounded, so a broken component can't
+hang the page forever) — a bare `st.rerun()` doesn't help here, since a
+rerun triggered from inside the script is purely server-side and never
+waits on the browser at all. The write side (`.set()` on login,
+`.delete()` on logout) had the mirror-image bug: an `st.rerun()`
+immediately after issuing the cookie instruction was tearing the
+just-mounted component back out of the page before its iframe had time
+to actually execute `document.cookie = ...`, so the write silently never
+happened. Both are now followed by a short real delay before the rerun
+that would otherwise cut them off.
+
+**Caching (`get_db_snapshot`, `get_order_details`).** Streamlit reruns
+the whole script on almost every UI interaction, so the sidebar's ERP
+snapshot is cached for 5 seconds (`@st.cache_data(ttl=5)`) rather than
+re-querying the database on every click when nothing's changed.
+`get_order_details` is cached per browser session (via
+`st.session_state`, not a bare module-level dict, since a real dict
+would be shared across every visitor hitting the same server process),
+since the same order is often looked up more than once while a single
+email is being processed. Both caches are invalidated exactly at the
+point `commit_order_modification` actually writes — the sidebar cache
+via an explicit `st.cache_data.clear()` right after a successful commit,
+the order-details cache by evicting that specific `order_id`'s entry.
+Feasibility checks (`check_order_modification`) are never cached, only
+ever queried live, so a stale cache can never be the reason an approval
+decision is wrong — only the reason a *display* is a few seconds behind.
 
 ## Limitations & Production Considerations
 
