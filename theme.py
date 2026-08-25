@@ -323,5 +323,8 @@ def stamp_html(status: str) -> str:
         "No Action": "stamp-info",
         "Pending Approval": "stamp-warn",
         "Rejected by Reviewer": "stamp-danger",
+        "Awaiting Reply": "stamp-info",
+        "Past Follow-Up": "stamp-danger",
+        "Needs Manual Linking": "stamp-warn",
     }.get(status, "stamp-info")
     return f'<span class="stamp {variant}">{status}</span>'

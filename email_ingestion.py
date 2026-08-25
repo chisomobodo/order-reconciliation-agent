@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS pending_emails (
     sender TEXT NOT NULL,
     subject TEXT NOT NULL,
     body TEXT NOT NULL,
+    in_reply_to TEXT,
+    references_header TEXT,
     fetched_at TEXT NOT NULL
 );
 
@@ -73,6 +75,8 @@ CREATE TABLE pending_emails (
     sender NVARCHAR(500) NOT NULL,
     subject NVARCHAR(998) NOT NULL,
     body NVARCHAR(MAX) NOT NULL,
+    in_reply_to NVARCHAR(998),
+    references_header NVARCHAR(MAX),
     fetched_at DATETIME2 NOT NULL
 );
 
@@ -90,6 +94,26 @@ CREATE TABLE processed_emails (
 """
 
 
+def _ensure_column(cursor, is_azure: bool, table: str, column: str, sqlite_type: str, azure_type: str):
+    """Adds `column` to `table` if it isn't already there. Needed because
+    CREATE TABLE IF NOT EXISTS (SQLite) / IF OBJECT_ID(...) IS NULL CREATE
+    TABLE (Azure) are no-ops once the table already exists from an earlier
+    deploy -- a column only added to the schema string above would never
+    actually reach a database that was set up before this change."""
+    if is_azure:
+        cursor.execute(
+            "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND COLUMN_NAME = ?",
+            (table, column),
+        )
+        if not cursor.fetchone():
+            cursor.execute(f"ALTER TABLE {table} ADD {column} {azure_type}")
+    else:
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cursor.fetchall()}
+        if column not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sqlite_type}")
+
+
 def init_email_tracking_schema(get_connection, is_azure: bool):
     """Creates the pending_emails/processed_emails tables if they don't
     exist. Call this once alongside auth.init_auth_schema."""
@@ -104,6 +128,8 @@ def init_email_tracking_schema(get_connection, is_azure: bool):
                 cursor.execute(statement)
     else:
         cursor.executescript(schema)
+    _ensure_column(cursor, is_azure, "pending_emails", "in_reply_to", "TEXT", "NVARCHAR(998)")
+    _ensure_column(cursor, is_azure, "pending_emails", "references_header", "TEXT", "NVARCHAR(MAX)")
     conn.commit()
     conn.close()
 
@@ -135,8 +161,12 @@ def sync_fetched_emails(get_connection, fetched: list[dict]) -> int:
         if cursor.fetchone():
             continue
         cursor.execute(
-            "INSERT INTO pending_emails (uid, sender, subject, body, fetched_at) VALUES (?, ?, ?, ?, ?)",
-            (item["uid"], item["sender"], item["subject"], item["body"], now),
+            "INSERT INTO pending_emails (uid, sender, subject, body, in_reply_to, references_header, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                item["uid"], item["sender"], item["subject"], item["body"],
+                item.get("in_reply_to"), item.get("references"), now,
+            ),
         )
         inserted += 1
 
@@ -152,13 +182,33 @@ def get_pending_emails(get_connection) -> list[dict]:
     an email and survives a page refresh."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT uid, sender, subject, body, fetched_at FROM pending_emails ORDER BY fetched_at")
+    cursor.execute(
+        "SELECT uid, sender, subject, body, in_reply_to, references_header, fetched_at "
+        "FROM pending_emails ORDER BY fetched_at"
+    )
     rows = cursor.fetchall()
     conn.close()
     return [
-        {"uid": r[0], "sender": r[1], "subject": r[2], "body": r[3], "fetched_at": r[4]}
+        {
+            "uid": r[0], "sender": r[1], "subject": r[2], "body": r[3],
+            "in_reply_to": r[4], "references": r[5], "fetched_at": r[6],
+        }
         for r in rows
     ]
+
+
+def remove_pending_email(get_connection, uid: str):
+    """Removes a pending email WITHOUT moving it to processed_emails --
+    used when hold_requests.match_reply_to_hold() finds it ambiguous
+    (more than one open Hold from the same sender): the email moves into
+    the manual-linking queue instead (hold_requests.
+    queue_for_manual_linking), to be processed later once a human picks
+    the right Hold."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM pending_emails WHERE uid = ?", (uid,))
+    conn.commit()
+    conn.close()
 
 
 def get_processed_emails(get_connection) -> list[dict]:
@@ -308,12 +358,20 @@ def fetch_new_order_emails() -> list[dict]:
             sender = _decode_mime_words(msg.get("From", ""))
             subject = _decode_mime_words(msg.get("Subject", "(no subject)"))
             body = _extract_body(msg)
+            # In-Reply-To/References are plain ASCII Message-ID tokens
+            # (RFC 5322), never MIME-encoded like subject/display names,
+            # so no _decode_mime_words() needed here -- used for Layer 1
+            # of hold_requests.match_reply_to_hold().
+            in_reply_to = msg.get("In-Reply-To")
+            references = msg.get("References")
 
             results.append({
                 "uid": uid.decode() if isinstance(uid, bytes) else uid,
                 "sender": sender,
                 "subject": subject,
                 "body": body,
+                "in_reply_to": in_reply_to.strip() if in_reply_to else None,
+                "references": references.strip() if references else None,
             })
 
         return results

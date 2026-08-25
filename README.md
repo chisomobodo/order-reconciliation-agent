@@ -237,6 +237,22 @@ One-time setup in Gmail itself (not code): create a label (e.g.
 `OrderRequests`) and route or manually apply it to whichever emails
 should be treated as customer order-change requests.
 
+Every reply the agent drafts (clarification questions, order-change
+confirmations — see "Approval-gated outbound email" below) sets its
+`Reply-To` to this same intake address, not a no-reply one, since a
+customer's reply needs to land back in `OrderRequests` for the next
+"Check Inbox" to pick it up — this is what the Hold-state feature is
+waiting on. Defaults to `<GMAIL_ADDRESS local-part>+orders@<domain>`
+(Gmail's own plus-addressing, matching the filter rule that routes mail
+into the `OrderRequests` label); override it explicitly if needed:
+
+```bash
+export ORDER_INTAKE_EMAIL=youraddress+orders@gmail.com  # optional -- derived from GMAIL_ADDRESS if unset
+```
+
+(Login-code emails from `auth.py` are unaffected — those keep a genuine
+no-reply address, since a reply is never expected there.)
+
 ## Docker & Deployment
 
 The app is containerized (`Dockerfile`, `.dockerignore`) and deployed to

@@ -26,6 +26,26 @@ GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 SENDER_DISPLAY_NAME = "Reconciliation Agent"
 
 
+def _default_order_intake_email():
+    """Falls back to the same plus-addressed intake convention
+    email_ingestion.py's IMAP_LABEL setup already documents (a Gmail
+    filter routes GMAIL_ADDRESS+orders@gmail.com into the OrderRequests
+    label) -- so Reply-To works out of the box without a second env var
+    to configure, unless ORDER_INTAKE_EMAIL is set to override it."""
+    if not GMAIL_ADDRESS or "@" not in GMAIL_ADDRESS:
+        return None
+    local_part, domain = GMAIL_ADDRESS.split("@", 1)
+    return f"{local_part}+orders@{domain}"
+
+
+# Order-related emails (clarification questions, confirmations) need
+# replies to flow back into the OrderRequests label for IMAP ingestion to
+# pick up -- the Hold-state feature depends on it. This is deliberately
+# NOT the same as auth.py's login-code Reply-To (noreply@...), which
+# stays genuinely no-reply since a reply is never expected there.
+ORDER_INTAKE_EMAIL = os.environ.get("ORDER_INTAKE_EMAIL") or _default_order_intake_email()
+
+
 SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS outbound_emails (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,6 +53,7 @@ CREATE TABLE IF NOT EXISTS outbound_emails (
     subject TEXT NOT NULL,
     body TEXT NOT NULL,
     context_note TEXT,
+    message_id TEXT,
     status TEXT NOT NULL DEFAULT 'Pending Approval',
     created_at TEXT NOT NULL,
     sent_at TEXT
@@ -47,11 +68,32 @@ CREATE TABLE outbound_emails (
     subject NVARCHAR(255) NOT NULL,
     body NVARCHAR(MAX) NOT NULL,
     context_note NVARCHAR(500),
+    message_id NVARCHAR(998),
     status NVARCHAR(30) NOT NULL DEFAULT 'Pending Approval',
     created_at DATETIME2 NOT NULL,
     sent_at DATETIME2
 );
 """
+
+
+def _ensure_column(cursor, is_azure: bool, table: str, column: str, sqlite_type: str, azure_type: str):
+    """Adds `column` to `table` if it isn't already there. Needed because
+    CREATE TABLE IF NOT EXISTS (SQLite) / IF OBJECT_ID(...) IS NULL CREATE
+    TABLE (Azure) are no-ops once the table already exists from an earlier
+    deploy -- a column only added to the schema string above would never
+    actually reach a database that was set up before this change."""
+    if is_azure:
+        cursor.execute(
+            "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND COLUMN_NAME = ?",
+            (table, column),
+        )
+        if not cursor.fetchone():
+            cursor.execute(f"ALTER TABLE {table} ADD {column} {azure_type}")
+    else:
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cursor.fetchall()}
+        if column not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sqlite_type}")
 
 
 def init_outbound_email_schema(get_connection, is_azure: bool):
@@ -65,21 +107,36 @@ def init_outbound_email_schema(get_connection, is_azure: bool):
                 cursor.execute(statement)
     else:
         cursor.executescript(SQLITE_SCHEMA)
+    _ensure_column(cursor, is_azure, "outbound_emails", "message_id", "TEXT", "NVARCHAR(998)")
     conn.commit()
     conn.close()
 
 
-def queue_draft(get_connection, to_email: str, subject: str, body: str, context_note: str = "") -> dict:
+def queue_draft(
+    get_connection,
+    to_email: str,
+    subject: str,
+    body: str,
+    context_note: str = "",
+    message_id: str | None = None,
+) -> dict:
     """Adds a drafted email to the approval queue. Does NOT send
-    anything -- this only ever creates a 'Pending Approval' row."""
+    anything -- this only ever creates a 'Pending Approval' row.
+
+    message_id, when given, is the Message-ID header hold_requests.
+    create_hold() already stored as sent_message_id for this same Hold --
+    it must be set on the ACTUAL outgoing email (in approve_and_send,
+    whenever a human eventually approves it) so a customer's mail client
+    reply carries a matching In-Reply-To header (Layer 1 of
+    hold_requests.match_reply_to_hold())."""
     conn = get_connection()
     cursor = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
 
     cursor.execute(
-        "INSERT INTO outbound_emails (to_email, subject, body, context_note, status, created_at) "
-        "VALUES (?, ?, ?, ?, 'Pending Approval', ?)",
-        (to_email, subject, body, context_note, now),
+        "INSERT INTO outbound_emails (to_email, subject, body, context_note, message_id, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 'Pending Approval', ?)",
+        (to_email, subject, body, context_note, message_id, now),
     )
     conn.commit()
 
@@ -101,7 +158,7 @@ def get_pending_drafts(get_connection) -> list[dict]:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, to_email, subject, body, context_note, created_at "
+        "SELECT id, to_email, subject, body, context_note, message_id, created_at "
         "FROM outbound_emails WHERE status = 'Pending Approval' ORDER BY created_at ASC"
     )
     rows = cursor.fetchall()
@@ -110,7 +167,7 @@ def get_pending_drafts(get_connection) -> list[dict]:
     return [
         {
             "id": r[0], "to_email": r[1], "subject": r[2],
-            "body": r[3], "context_note": r[4], "created_at": r[5],
+            "body": r[3], "context_note": r[4], "message_id": r[5], "created_at": r[6],
         }
         for r in rows
     ]
@@ -134,15 +191,32 @@ def get_sent_log(get_connection) -> list[dict]:
     ]
 
 
-def _send_via_smtp(to_email: str, subject: str, body: str):
+def _send_via_smtp(to_email: str, subject: str, body: str, message_id: str | None = None):
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
         raise RuntimeError("GMAIL_ADDRESS and GMAIL_APP_PASSWORD must be set to send email.")
+    if not ORDER_INTAKE_EMAIL:
+        raise RuntimeError(
+            "Could not determine an order-intake Reply-To address. Set ORDER_INTAKE_EMAIL "
+            "explicitly, or GMAIL_ADDRESS so it can be derived as <local>+orders@<domain>."
+        )
 
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = formataddr((SENDER_DISPLAY_NAME, GMAIL_ADDRESS))
     msg["To"] = to_email
-    msg["Reply-To"] = "noreply@reconciliation-agent.local"
+    # A customer reply needs to land back in the OrderRequests label for
+    # IMAP ingestion to pick it up (this is what Hold state is waiting
+    # on) -- NOT a no-reply address like auth.py's login codes use.
+    msg["Reply-To"] = ORDER_INTAKE_EMAIL
+    if message_id:
+        # Set only for Hold-linked clarifying questions -- app.py generates
+        # this via email.utils.make_msgid() at Hold-creation time (before
+        # this send, which may happen much later once a human approves the
+        # draft) and stores it as hold_requests.sent_message_id, so a
+        # customer's reply carries a matching In-Reply-To header for
+        # Layer 1 of match_reply_to_hold(). Other emails are sent without
+        # an explicit Message-ID, same as before this feature.
+        msg["Message-ID"] = message_id
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
@@ -158,7 +232,7 @@ def approve_and_send(get_connection, draft_id: int) -> dict:
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT to_email, subject, body, status FROM outbound_emails WHERE id = ?",
+        "SELECT to_email, subject, body, status, message_id FROM outbound_emails WHERE id = ?",
         (draft_id,),
     )
     row = cursor.fetchone()
@@ -167,13 +241,13 @@ def approve_and_send(get_connection, draft_id: int) -> dict:
         conn.close()
         return {"status": "Error", "message": "Draft not found."}
 
-    to_email, subject, body, status = row
+    to_email, subject, body, status, message_id = row
     if status != "Pending Approval":
         conn.close()
         return {"status": "Error", "message": f"This draft is already '{status}', not pending."}
 
     try:
-        _send_via_smtp(to_email, subject, body)
+        _send_via_smtp(to_email, subject, body, message_id=message_id)
     except Exception as e:
         conn.close()
         return {"status": "Error", "message": f"Failed to send: {e}"}

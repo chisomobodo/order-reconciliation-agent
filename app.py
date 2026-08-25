@@ -13,7 +13,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from email.utils import parseaddr
+from email.utils import parseaddr, make_msgid
 
 import extra_streamlit_components as stx
 from extra_streamlit_components.CookieManager import _component_func as _cookie_component
@@ -24,6 +24,7 @@ import streamlit as st
 import auth
 import auth_theme
 import email_ingestion
+import hold_requests
 import outbound_email
 from theme import build_css, email_card_html, step_card_html, stamp_html
 
@@ -125,12 +126,48 @@ if DB_INIT_ERROR:
     st.stop()
 
 
+# --- Startup schema init: retry, same pattern as the sidebar's ERP
+# snapshot ---
+# The four _ensure_*_schema() calls just below are the FIRST database
+# connections the app makes -- before the cookie/session check, before
+# the auth screen, before anything else that renders. get_db_snapshot()
+# (sidebar, defined later in this file) already retries on a cold Azure
+# SQL connection; these calls had no such protection, so a single
+# transient timeout here crashed the whole app with a raw traceback
+# before the user ever saw a page. Reusing the exact same retry shape
+# (5 attempts, 1.5s apart) -- the per-attempt Connection Timeout=10 in
+# agent_engine_azure.py's connection string already applies here too,
+# since auth_get_connection IS that same get_connection function in
+# Azure mode, not a separate one that needs its own timeout change.
+STARTUP_DB_MAX_ATTEMPTS = 5
+STARTUP_DB_RETRY_DELAY_S = 1.5
+
+
+def _connect_with_retry():
+    """Drop-in replacement for auth_get_connection, passed as the
+    get_connection argument to each schema-init function below so their
+    own internal `conn = get_connection()` call transparently gets retry
+    behavior with no changes needed in auth.py/email_ingestion.py/
+    outbound_email.py/hold_requests.py themselves. Harmless for local
+    SQLite too -- sqlite3.connect() doesn't fail on a cold start, so the
+    loop just succeeds on the first attempt every time."""
+    last_error = None
+    for attempt in range(1, STARTUP_DB_MAX_ATTEMPTS + 1):
+        try:
+            return auth_get_connection()
+        except Exception as e:
+            last_error = e
+            if attempt < STARTUP_DB_MAX_ATTEMPTS:
+                time.sleep(STARTUP_DB_RETRY_DELAY_S)
+    raise last_error
+
+
 @st.cache_resource
 def _ensure_auth_schema():
     """Runs once for the life of the process (st.cache_resource, not
     cache_data -- this is setup, not data), alongside the ERP tables in
     the same database."""
-    auth.init_auth_schema(auth_get_connection, is_azure=USE_AZURE_DB)
+    auth.init_auth_schema(_connect_with_retry, is_azure=USE_AZURE_DB)
     return True
 
 
@@ -138,7 +175,7 @@ def _ensure_auth_schema():
 def _ensure_email_tracking_schema():
     """Same pattern as _ensure_auth_schema -- pending_emails/
     processed_emails live in the same database, created once per process."""
-    email_ingestion.init_email_tracking_schema(auth_get_connection, is_azure=USE_AZURE_DB)
+    email_ingestion.init_email_tracking_schema(_connect_with_retry, is_azure=USE_AZURE_DB)
     return True
 
 
@@ -146,13 +183,42 @@ def _ensure_email_tracking_schema():
 def _ensure_outbound_email_schema():
     """Same pattern again -- outbound_emails (the send-approval queue)
     lives in the same database, created once per process."""
-    outbound_email.init_outbound_email_schema(auth_get_connection, is_azure=USE_AZURE_DB)
+    outbound_email.init_outbound_email_schema(_connect_with_retry, is_azure=USE_AZURE_DB)
     return True
 
 
-_ensure_auth_schema()
-_ensure_email_tracking_schema()
-_ensure_outbound_email_schema()
+@st.cache_resource
+def _ensure_hold_requests_schema():
+    """Same pattern again -- hold_requests (orders paused on a
+    clarifying question) lives in the same database, created once per
+    process."""
+    hold_requests.init_hold_requests_schema(_connect_with_retry, is_azure=USE_AZURE_DB)
+    return True
+
+
+try:
+    with st.spinner(f"Connecting to {DB_MODE}..."):
+        _ensure_auth_schema()
+        _ensure_email_tracking_schema()
+        _ensure_outbound_email_schema()
+        _ensure_hold_requests_schema()
+except Exception as e:
+    # Every retry attempt is exhausted at this point -- show a clean
+    # message instead of the raw traceback Streamlit would otherwise
+    # render for an uncaught exception this early in the script.
+    st.markdown(
+        '<div class="manifest-title"><span class="accent-bar"></span>Reconciliation Agent</div>',
+        unsafe_allow_html=True,
+    )
+    st.error(
+        f"Could not connect to {DB_MODE} to set up the database after "
+        f"{STARTUP_DB_MAX_ATTEMPTS} attempts: {e}\n\n"
+        "This is usually a transient cold-start delay -- reloading the page in "
+        "a few moments often resolves it. If it keeps happening, check that "
+        "AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, and "
+        "AZURE_SQL_PASSWORD are all correct."
+    )
+    st.stop()
 
 # --- Session cookie: read side ---
 # CookieManager.get()/get_all() hardcode default={} internally (confirmed
@@ -314,7 +380,7 @@ def _render_auth_screen():
                     restart_clicked = st.form_submit_button("Start over", type="secondary")
 
                 if verify_clicked:
-                    result = auth.verify_login_code(auth_get_connection, st.session_state.login_user_id, code)
+                    result = auth.verify_login_code(auth_get_connection, st.session_state.login_user_id, code, is_azure=USE_AZURE_DB)
                     if result.get("status") == "Success":
                         session_token = result["session_token"]
                         # Constructed here rather than at module scope --
@@ -395,25 +461,58 @@ def find_verified_change(tool_log):
     return None
 
 
-def _process_pending_email(item):
-    """Runs one pending inbox email (a dict from email_ingestion.
-    get_pending_emails) through the exact same run_agent() pipeline as a
-    manually pasted email -- same approval-gate handling (auto-commit, or
-    queued for manual review). Updates st.session_state.last_result with
-    the outcome, so the "Agent Execution" panel shows this result in
-    place of whatever was there before (the same single-result pattern
-    used before ingestion was added -- not an accumulating list, whether
-    triggered by the per-email "Process" button or by "Process All"
-    working through several in a row).
+def find_clarification_request(tool_log):
+    """Scans a run's tool log for a request_clarification call, and
+    returns its inputs (order_id, ambiguous_reference, candidate_skus,
+    clarifying_question) -- order_id is only present if the customer
+    actually gave one (it's an optional field in the tool schema).
+    Returns None if no such call is present."""
+    if not tool_log:
+        return None
+    for call in reversed(tool_log):
+        if call["tool_called"] == "request_clarification":
+            return call["inputs"]
+    return None
+
+
+def _build_combined_context(hold: dict, new_reply_body: str) -> str:
+    """Builds the full context run_agent() needs when a fetched email is
+    a reply to an existing Hold -- the customer's new reply alone (often
+    just "the 24-pack" or similar) isn't enough context to act on, so
+    the original inbound email and the clarifying question we sent are
+    included alongside it."""
+    return (
+        f"--- Original customer request ---\n{hold['inbound_body']}\n\n"
+        f"--- Clarifying question we sent ---\n{hold['clarifying_question_sent']}\n\n"
+        f"--- Customer's reply ---\n{new_reply_body}"
+    )
+
+
+def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, matched_hold: dict | None = None):
+    """Core of processing one inbound email through the agent -- shared
+    by a brand-new pending email (matched_hold=None), a reply
+    automatically matched to an open Hold (Layers 1-3), and a reply a
+    human manually linked to a Hold (Layer 4). agent_input is what's
+    actually sent to run_agent() (either item["body"] as-is, or original
+    request + clarifying question + new reply combined via
+    _build_combined_context()) -- but item/record_processed_email always
+    use the real, individual inbound email's own fields, so the
+    processed-email log reflects what actually arrived, not the
+    constructed context.
+
+    Updates st.session_state.last_result with the outcome, so the
+    "Agent Execution" panel shows this result in place of whatever was
+    there before (a single-result panel, not an accumulating list).
 
     On success, moves the email from pending_emails to processed_emails
     in the database (email_ingestion.record_processed_email) and marks
     it processed in Gmail. If run_agent() itself raises, the email is
-    deliberately left in pending_emails and never marked processed in
-    Gmail, so it's retried on the next inbox check rather than silently
-    lost to a transient failure (e.g. a dropped Claude API call)."""
+    deliberately left wherever the caller found it (pending_emails or
+    manual_linking_emails) and never marked processed in Gmail, so it's
+    retried rather than silently lost to a transient failure (e.g. a
+    dropped Claude API call)."""
     try:
-        tool_log, final_result, reply = run_agent(item["body"])
+        tool_log, final_result, reply = run_agent(agent_input)
     except Exception as e:
         st.session_state.last_result = {"error": str(e)}
         return
@@ -429,26 +528,75 @@ def _process_pending_email(item):
     st.session_state.last_commit_result = None
 
     verified_change = find_verified_change(tool_log) if tool_log else None
+    clarification_request = find_clarification_request(tool_log) if tool_log else None
 
-    # Queue the drafted reply for human approval before it's ever sent --
-    # same check/commit-style gate already used for database writes, now
-    # extended to outbound email. Every drafted reply is queued here,
-    # regardless of outcome (a clarification question needs sending just
-    # as much as an order confirmation does). item["sender"] is the raw
-    # "From" header (can be "Display Name <addr>", not a bare address) --
-    # parseaddr() pulls out just the address smtplib actually needs.
-    sender_address = parseaddr(item["sender"])[1] or item["sender"]
-    outbound_email.queue_draft(
-        auth_get_connection,
-        to_email=sender_address,
-        subject=f"Re: {item['subject']}",
-        body=reply,
-        context_note=(
-            f"Order {verified_change['order_id']} — from inbox ({item['sender']})"
-            if verified_change
-            else f"{final_result.get('status') if final_result else 'No Action'} — from inbox ({item['sender']})"
-        ),
-    )
+    if matched_hold:
+        # This reply resolves an existing Hold -- never opens a new one,
+        # even if the agent's new reply is itself still a clarification
+        # question. A still-ambiguous follow-up isn't automatically
+        # re-held in this version; it's sent back to the customer as a
+        # normal reply, and the original Hold is marked resolved since
+        # the conversation has moved forward (flagged as a known
+        # limitation, not silently expanded here -- see README).
+        hold_requests.resolve_hold(auth_get_connection, matched_hold["id"])
+        outbound_email.queue_draft(
+            auth_get_connection,
+            to_email=sender_address,
+            subject=f"Re: {item['subject']}",
+            body=reply,
+            context_note=f"Reply to HOLD-{matched_hold['id']} — from inbox ({item['sender']})",
+        )
+    elif clarification_request and clarification_request.get("order_id"):
+        # A genuinely NEW clarification request -- place the order on
+        # hold so it isn't silently lost while waiting on the customer's
+        # reply (see hold_requests.py / CLAUDE.md "Hold state design").
+        # The Message-ID is generated here, BEFORE the email is actually
+        # sent (sending is gated behind human approval and may happen
+        # much later) -- stored on the Hold now, and passed through to
+        # queue_draft() so approve_and_send() can set it as the real
+        # outgoing Message-ID header once a human approves it. The
+        # HOLD-{id} tag in the subject/body is Layer 2's fallback in case
+        # In-Reply-To/References ever gets stripped by a mail client.
+        sent_message_id = make_msgid()
+        hold_result = hold_requests.create_hold(
+            auth_get_connection,
+            order_id=clarification_request["order_id"],
+            customer_email=sender_address,
+            inbound_sender=item["sender"],
+            inbound_subject=item["subject"],
+            inbound_body=item["body"],
+            clarifying_question_sent=reply,
+            sent_message_id=sent_message_id,
+        )
+        hold_id = hold_result["hold_id"]
+        outbound_email.queue_draft(
+            auth_get_connection,
+            to_email=sender_address,
+            subject=f"Re: {item['subject']} [HOLD-{hold_id}]",
+            body=(
+                f"{reply}\n\n"
+                f"To help us match your reply to the right request, please keep "
+                f"the reference HOLD-{hold_id} somewhere in your reply."
+            ),
+            message_id=sent_message_id,
+            context_note=f"Order {clarification_request['order_id']} — from inbox ({item['sender']})",
+        )
+    else:
+        # Queue the drafted reply for human approval before it's ever
+        # sent -- same check/commit-style gate already used for database
+        # writes, now extended to outbound email. Every drafted reply is
+        # queued here, regardless of outcome.
+        outbound_email.queue_draft(
+            auth_get_connection,
+            to_email=sender_address,
+            subject=f"Re: {item['subject']}",
+            body=reply,
+            context_note=(
+                f"Order {verified_change['order_id']} — from inbox ({item['sender']})"
+                if verified_change
+                else f"{final_result.get('status') if final_result else 'No Action'} — from inbox ({item['sender']})"
+            ),
+        )
 
     if final_result and final_result.get("status") == "Success" and verified_change:
         if st.session_state.auto_approve:
@@ -486,6 +634,36 @@ def _process_pending_email(item):
         reply_text=reply,
     )
     email_ingestion.mark_processed(item["uid"])
+
+
+def _process_pending_email(item):
+    """Entry point for a normal pending-inbox email (the "Process" /
+    "Process All" buttons). Before treating it as a new request, checks
+    it against open Holds via hold_requests.match_reply_to_hold() -- see
+    that function's docstring for the four-layer matching order. An
+    "ambiguous" result (Layer 3 found more than one open Hold for this
+    sender) is never guessed at: the email is moved into the
+    manual-linking queue for a human to resolve instead of being
+    processed here."""
+    sender_address = parseaddr(item["sender"])[1] or item["sender"]
+
+    match_result = hold_requests.match_reply_to_hold(
+        auth_get_connection,
+        sender_email=sender_address,
+        subject=item["subject"],
+        body=item["body"],
+        in_reply_to=item.get("in_reply_to"),
+        references=item.get("references"),
+    )
+
+    if match_result["status"] == "ambiguous":
+        hold_requests.queue_for_manual_linking(auth_get_connection, item)
+        email_ingestion.remove_pending_email(auth_get_connection, item["uid"])
+        return
+
+    matched_hold = match_result.get("hold")
+    agent_input = _build_combined_context(matched_hold, item["body"]) if matched_hold else item["body"]
+    _run_agent_and_dispatch(agent_input, item, sender_address, matched_hold=matched_hold)
 
 
 def db_mode_badge_html(mode: str, has_error: bool) -> str:
@@ -809,6 +987,7 @@ with col2:
                 st.session_state.last_commit_result = None
 
                 verified_change = find_verified_change(tool_log) if tool_log else None
+                clarification_request = find_clarification_request(tool_log) if tool_log else None
 
                 # Queue the drafted reply for human approval before it's
                 # ever sent -- same check/commit-style gate already used
@@ -817,16 +996,58 @@ with col2:
                 # fires for a verified change), so it happens for every
                 # outcome -- including a clarification question, which
                 # still needs to reach the customer.
-                outbound_email.queue_draft(
-                    auth_get_connection,
-                    to_email=sender_email.strip(),
-                    subject=f"Re: {original_subject}",
-                    body=reply,
-                    context_note=(
-                        f"Order {verified_change['order_id']}" if verified_change
-                        else (final_result.get("status") if final_result else "No Action")
-                    ),
-                )
+                #
+                # If this was a clarification request AND an order ID was
+                # actually given, place that order on hold so it isn't
+                # silently lost while waiting on the customer's reply --
+                # see hold_requests.py / CLAUDE.md "Hold state design".
+                # The Message-ID is generated here, BEFORE the email is
+                # actually sent (sending is gated behind human approval),
+                # stored on the Hold now, and passed through to
+                # queue_draft() so approve_and_send() can set it as the
+                # real outgoing Message-ID header once approved -- this is
+                # what lets a real reply to this question (ingested later
+                # via IMAP) be matched back automatically. The HOLD-{id}
+                # tag in the subject/body is a fallback in case
+                # In-Reply-To/References ever gets stripped. No order ID
+                # -> nothing to hold; just queue the clarification email
+                # normally.
+                if clarification_request and clarification_request.get("order_id"):
+                    sent_message_id = make_msgid()
+                    hold_result = hold_requests.create_hold(
+                        auth_get_connection,
+                        order_id=clarification_request["order_id"],
+                        customer_email=sender_email.strip(),
+                        inbound_sender=sender_email.strip(),
+                        inbound_subject=original_subject,
+                        inbound_body=email_body,
+                        clarifying_question_sent=reply,
+                        sent_message_id=sent_message_id,
+                    )
+                    hold_id = hold_result["hold_id"]
+                    outbound_email.queue_draft(
+                        auth_get_connection,
+                        to_email=sender_email.strip(),
+                        subject=f"Re: {original_subject} [HOLD-{hold_id}]",
+                        body=(
+                            f"{reply}\n\n"
+                            f"To help us match your reply to the right request, please keep "
+                            f"the reference HOLD-{hold_id} somewhere in your reply."
+                        ),
+                        message_id=sent_message_id,
+                        context_note=f"Order {clarification_request['order_id']}",
+                    )
+                else:
+                    outbound_email.queue_draft(
+                        auth_get_connection,
+                        to_email=sender_email.strip(),
+                        subject=f"Re: {original_subject}",
+                        body=reply,
+                        context_note=(
+                            f"Order {verified_change['order_id']}" if verified_change
+                            else (final_result.get("status") if final_result else "No Action")
+                        ),
+                    )
 
                 if final_result and final_result.get("status") == "Success" and verified_change:
                     if st.session_state.auto_approve:
@@ -952,6 +1173,139 @@ with col2:
             st.divider()
     else:
         st.caption("No outbound emails currently pending approval.")
+
+    st.divider()
+    st.markdown("**⏳ Awaiting Customer Reply**")
+    st.caption(
+        "Orders on hold pending an answer to a clarifying question -- nothing here is ever "
+        "auto-processed, regardless of how long it waits."
+    )
+    awaiting_holds = hold_requests.get_awaiting_reply(auth_get_connection)
+    if awaiting_holds:
+        for hold in awaiting_holds:
+            st.markdown(stamp_html("Awaiting Reply"), unsafe_allow_html=True)
+            st.markdown(
+                f"**Order:** {html.escape(hold['order_id'] or '?')} — "
+                f"**From:** {html.escape(hold['customer_email'])}"
+            )
+            st.markdown(
+                f"""<div class="reply-card">
+                <b>Customer wrote →</b><br>
+                <i>Subject: {html.escape(hold['inbound_subject'])}</i><br><br>
+                {html.escape(hold['inbound_body'])}
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"""<div class="reply-card">
+                <b>Agent asked →</b><br><br>
+                {hold['clarifying_question_sent']}
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            st.divider()
+    else:
+        st.caption("No orders currently on hold.")
+
+    st.markdown("**🚨 Needs Attention**")
+    st.caption(
+        "Holds where the follow-up window has passed with no reply -- a human needs to "
+        "decide what happens next. (Empty until the scheduled follow-up job exists.)"
+    )
+    past_follow_up = hold_requests.get_past_follow_up(auth_get_connection)
+    if past_follow_up:
+        for hold in past_follow_up:
+            st.markdown(stamp_html("Past Follow-Up"), unsafe_allow_html=True)
+            st.markdown(
+                f"**Order:** {html.escape(hold['order_id'] or '?')} — "
+                f"**From:** {html.escape(hold['customer_email'])}"
+            )
+            st.markdown(
+                f"""<div class="reply-card">
+                <b>Customer wrote →</b><br>
+                <i>Subject: {html.escape(hold['inbound_subject'])}</i><br><br>
+                {html.escape(hold['inbound_body'])}
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"""<div class="reply-card">
+                <b>Agent asked →</b><br><br>
+                {hold['clarifying_question_sent']}
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            if hold.get("follow_up_body"):
+                st.markdown(
+                    f"""<div class="reply-card">
+                    <b>Follow-up sent →</b><br><br>
+                    {hold['follow_up_body']}
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+            if st.button("Mark Resolved", key=f"resolve_hold_{hold['id']}", use_container_width=True):
+                hold_requests.resolve_hold(auth_get_connection, hold["id"])
+                st.toast("Hold marked resolved.", icon="✅")
+                st.rerun()
+            st.divider()
+    else:
+        st.caption("Nothing needs attention right now.")
+
+    st.markdown("**🔗 Needs Manual Linking**")
+    st.caption(
+        "This sender has more than one order on hold, so which one this reply belongs to "
+        "can't be determined automatically -- pick the right one, or treat it as a new request."
+    )
+    manual_linking_items = hold_requests.get_manual_linking_emails(auth_get_connection)
+    if manual_linking_items:
+        for ml_item in manual_linking_items:
+            ml_sender_address = parseaddr(ml_item["sender"])[1] or ml_item["sender"]
+            candidates = hold_requests.get_open_holds_for_sender(auth_get_connection, ml_sender_address)
+
+            st.markdown(stamp_html("Needs Manual Linking"), unsafe_allow_html=True)
+            st.markdown(
+                f"**From:** {html.escape(ml_item['sender'])} — "
+                f"**Subject:** {html.escape(ml_item['subject'])}"
+            )
+            st.markdown(
+                f"""<div class="reply-card">{html.escape(ml_item['body'])}</div>""",
+                unsafe_allow_html=True,
+            )
+
+            if candidates:
+                st.caption(f"{len(candidates)} open hold(s) from this sender:")
+                for candidate in candidates:
+                    cand_col, link_col = st.columns([4, 1.3])
+                    with cand_col:
+                        st.markdown(
+                            f"HOLD-{candidate['id']} — Order **{html.escape(candidate['order_id'] or '?')}** — "
+                            f"*{html.escape(candidate['inbound_subject'])}*"
+                        )
+                    with link_col:
+                        if st.button(
+                            "Link", key=f"link_hold_{ml_item['uid']}_{candidate['id']}", use_container_width=True
+                        ):
+                            agent_input = _build_combined_context(candidate, ml_item["body"])
+                            _run_agent_and_dispatch(agent_input, ml_item, ml_sender_address, matched_hold=candidate)
+                            hold_requests.remove_from_manual_linking(auth_get_connection, ml_item["uid"])
+                            st.rerun()
+            else:
+                # The candidate holds that made this ambiguous may have
+                # since been resolved by the time a human looks at it --
+                # nothing left to link to.
+                st.caption("No open holds from this sender remain.")
+
+            if st.button(
+                "Not a reply — treat as new request",
+                key=f"treat_as_new_{ml_item['uid']}",
+                use_container_width=True,
+            ):
+                _run_agent_and_dispatch(ml_item["body"], ml_item, ml_sender_address, matched_hold=None)
+                hold_requests.remove_from_manual_linking(auth_get_connection, ml_item["uid"])
+                st.rerun()
+            st.divider()
+    else:
+        st.caption("Nothing needs manual linking right now.")
 
 # --- Sidebar: live ERP ledger ---
 # Rendered last, after the header/CSS/toggles and the main email/agent

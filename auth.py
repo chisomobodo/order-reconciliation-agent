@@ -41,6 +41,21 @@ CODE_VALID_MINUTES = 10
 SESSION_INACTIVITY_MINUTES = 20
 
 
+def _parse_datetime(value):
+    """Reads a timestamp back from either backend. SQLite returns
+    exactly what was stored -- a string, since these columns hold
+    .isoformat() text -- but pyodbc auto-converts Azure SQL's DATETIME2
+    columns into native datetime objects instead, so datetime.
+    fromisoformat() alone raises TypeError there. Handles both, and
+    makes sure the result is timezone-aware either way: DATETIME2 has no
+    timezone concept, so a native datetime object back from pyodbc is
+    always naive, same as a plain fromisoformat() parse can be."""
+    dt = datetime.fromisoformat(value) if isinstance(value, str) else value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 # ---------------------------------------------------------------------
 # Schema (call once at app startup / in setup_db.py & setup_db_azure.py)
 # ---------------------------------------------------------------------
@@ -229,17 +244,28 @@ def request_login_code(get_connection, email: str, password: str) -> dict:
 # Login step 2: verify the code, create a session
 # ---------------------------------------------------------------------
 
-def verify_login_code(get_connection, user_id: int, submitted_code: str) -> dict:
+def verify_login_code(get_connection, user_id: int, submitted_code: str, is_azure: bool) -> dict:
     """Step 2 of login: check the code, and if valid, create a session.
-    Returns {'status': 'Success', 'session_token': ...} or an Error."""
+    Returns {'status': 'Success', 'session_token': ...} or an Error.
+
+    is_azure picks the right "most recent row" syntax -- LIMIT 1 is
+    SQLite-only; Azure SQL (T-SQL) has no LIMIT clause at all and needs
+    TOP 1 placed right after SELECT instead of at the end of the query."""
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute(
-        "SELECT id, code, expires_at, used FROM login_codes "
-        "WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-        (user_id,),
-    )
+    if is_azure:
+        cursor.execute(
+            "SELECT TOP 1 id, code, expires_at, used FROM login_codes "
+            "WHERE user_id = ? ORDER BY id DESC",
+            (user_id,),
+        )
+    else:
+        cursor.execute(
+            "SELECT id, code, expires_at, used FROM login_codes "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        )
     row = cursor.fetchone()
 
     if not row:
@@ -252,7 +278,7 @@ def verify_login_code(get_connection, user_id: int, submitted_code: str) -> dict
         conn.close()
         return {"status": "Error", "message": "This code has already been used. Please request a new one."}
 
-    if datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
+    if _parse_datetime(expires_at) < datetime.now(timezone.utc):
         conn.close()
         return {"status": "Error", "message": "This code has expired. Please request a new one."}
 
@@ -303,9 +329,7 @@ def validate_session(get_connection, session_token: str) -> dict:
         return {"status": "Invalid"}
 
     user_id, last_active_at, email, name = row
-    last_active = datetime.fromisoformat(last_active_at)
-    if last_active.tzinfo is None:
-        last_active = last_active.replace(tzinfo=timezone.utc)
+    last_active = _parse_datetime(last_active_at)
 
     if datetime.now(timezone.utc) - last_active > timedelta(minutes=SESSION_INACTIVITY_MINUTES):
         # Expired from inactivity -- clean it up.
