@@ -19,10 +19,11 @@ Design principles (do not weaken these):
     only the clarification email itself matters, and that's handled
     entirely by outbound_email.py, not this module.
 """
+import os
 import re
 from datetime import datetime, timezone
 
-FOLLOW_UP_WINDOW_MINUTES = 20
+FOLLOW_UP_WINDOW_MINUTES = int(os.environ.get("FOLLOW_UP_WINDOW_MINUTES", "30"))
 
 # Matches the HOLD-{id} reference we ask customers to keep in their reply
 # (Layer 2 matching) -- also appears bracketed in the subject, e.g.
