@@ -25,6 +25,7 @@ Run manually for testing: python3 check_holds.py
 """
 import os
 import sys
+from contextlib import closing
 
 import hold_requests
 import outbound_email
@@ -53,41 +54,47 @@ Thanks for your patience.
 
 def run_check():
     """One pass: find holds due for a follow-up, draft (queue, don't
-    send) a follow-up email for each, mark them 'Past Follow-Up'."""
-    due_holds = hold_requests.get_holds_due_for_follow_up(get_connection)
+    send) a follow-up email for each, mark them 'Past Follow-Up'.
 
-    if not due_holds:
-        print("No holds currently due for a follow-up.")
-        return {"checked": True, "follow_ups_drafted": 0}
+    Opens a single connection for the whole pass -- independent of the
+    web app's own per-action connection handling, since this is a
+    separate scheduled-job entrypoint (see module docstring) that never
+    runs inside app.py's process."""
+    with closing(get_connection()) as conn:
+        due_holds = hold_requests.get_holds_due_for_follow_up(conn)
 
-    print(f"Found {len(due_holds)} hold(s) past the follow-up window.")
+        if not due_holds:
+            print("No holds currently due for a follow-up.")
+            return {"checked": True, "follow_ups_drafted": 0}
 
-    drafted_count = 0
-    for hold in due_holds:
-        order_id = hold["order_id"] or "your request"
-        subject = FOLLOW_UP_SUBJECT_TEMPLATE.format(
-            order_id=order_id, hold_id=hold["id"]
-        )
-        body = FOLLOW_UP_BODY_TEMPLATE.format(
-            order_id=order_id,
-            clarifying_question=hold["clarifying_question_sent"],
-            hold_id=hold["id"],
-        )
+        print(f"Found {len(due_holds)} hold(s) past the follow-up window.")
 
-        result = outbound_email.queue_draft(
-            get_connection,
-            to_email=hold["customer_email"],
-            subject=subject,
-            body=body,
-            context_note=f"Follow-up for HOLD-{hold['id']} (order {order_id})",
-        )
+        drafted_count = 0
+        for hold in due_holds:
+            order_id = hold["order_id"] or "your request"
+            subject = FOLLOW_UP_SUBJECT_TEMPLATE.format(
+                order_id=order_id, hold_id=hold["id"]
+            )
+            body = FOLLOW_UP_BODY_TEMPLATE.format(
+                order_id=order_id,
+                clarifying_question=hold["clarifying_question_sent"],
+                hold_id=hold["id"],
+            )
 
-        if result["status"] == "Queued":
-            hold_requests.mark_follow_up_sent(get_connection, hold["id"], body)
-            drafted_count += 1
-            print(f"  HOLD-{hold['id']}: follow-up drafted and queued for approval.")
-        else:
-            print(f"  HOLD-{hold['id']}: failed to queue follow-up -- {result}")
+            result = outbound_email.queue_draft(
+                conn,
+                to_email=hold["customer_email"],
+                subject=subject,
+                body=body,
+                context_note=f"Follow-up for HOLD-{hold['id']} (order {order_id})",
+            )
+
+            if result["status"] == "Queued":
+                hold_requests.mark_follow_up_sent(conn, hold["id"], body)
+                drafted_count += 1
+                print(f"  HOLD-{hold['id']}: follow-up drafted and queued for approval.")
+            else:
+                print(f"  HOLD-{hold['id']}: failed to queue follow-up -- {result}")
 
     print(f"Done. {drafted_count} follow-up(s) drafted and awaiting human approval.")
     return {"checked": True, "follow_ups_drafted": drafted_count}

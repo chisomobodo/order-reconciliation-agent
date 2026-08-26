@@ -126,8 +126,8 @@ def _ensure_column(cursor, is_azure: bool, table: str, column: str, sqlite_type:
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sqlite_type}")
 
 
-def init_hold_requests_schema(get_connection, is_azure: bool):
-    conn = get_connection()
+def init_hold_requests_schema(conn, is_azure: bool):
+    """Takes an already-open connection -- caller owns its lifecycle."""
     cursor = conn.cursor()
     if is_azure:
         for statement in AZURE_SQL_SCHEMA.split(";"):
@@ -137,11 +137,10 @@ def init_hold_requests_schema(get_connection, is_azure: bool):
         cursor.executescript(SQLITE_SCHEMA)
     _ensure_column(cursor, is_azure, "hold_requests", "sent_message_id", "TEXT", "NVARCHAR(998)")
     conn.commit()
-    conn.close()
 
 
 def create_hold(
-    get_connection,
+    conn,
     order_id: str | None,
     customer_email: str,
     inbound_sender: str,
@@ -154,7 +153,8 @@ def create_hold(
     an order ID was actually given. If order_id is None, the caller
     should NOT call this -- there's nothing to place on hold, only the
     clarification email itself matters (handled by outbound_email.py
-    separately).
+    separately). Takes an already-open connection -- caller owns its
+    lifecycle.
 
     sent_message_id is the Message-ID header generated (via
     email.utils.make_msgid()) for the outgoing clarifying question,
@@ -162,7 +162,6 @@ def create_hold(
     since sending is gated behind human approval and may happen much
     later. This is what Layer 1 of match_reply_to_hold() checks a
     reply's In-Reply-To/References against."""
-    conn = get_connection()
     cursor = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
 
@@ -181,15 +180,13 @@ def create_hold(
         (customer_email, now),
     )
     row = cursor.fetchone()
-    conn.close()
 
     return {"status": "Success", "hold_id": row[0] if row else None}
 
 
-def get_awaiting_reply(get_connection) -> list[dict]:
+def get_awaiting_reply(conn) -> list[dict]:
     """All holds still waiting on a customer reply (not yet past the
     follow-up window), oldest first."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, order_id, customer_email, inbound_sender, inbound_subject, "
@@ -197,14 +194,12 @@ def get_awaiting_reply(get_connection) -> list[dict]:
         "FROM hold_requests WHERE status = 'Awaiting Reply' ORDER BY sent_at ASC"
     )
     rows = cursor.fetchall()
-    conn.close()
     return [_row_to_dict(r, has_follow_up=False) for r in rows]
 
 
-def get_past_follow_up(get_connection) -> list[dict]:
+def get_past_follow_up(conn) -> list[dict]:
     """All holds that have had a follow-up sent and still need a human
     decision -- surface these prominently in the dashboard."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, order_id, customer_email, inbound_sender, inbound_subject, "
@@ -212,7 +207,6 @@ def get_past_follow_up(get_connection) -> list[dict]:
         "FROM hold_requests WHERE status = 'Past Follow-Up' ORDER BY follow_up_sent_at ASC"
     )
     rows = cursor.fetchall()
-    conn.close()
     return [_row_to_dict(r, has_follow_up=True) for r in rows]
 
 
@@ -228,13 +222,12 @@ def _row_to_dict(row, has_follow_up: bool) -> dict:
     return d
 
 
-def _get_open_holds(get_connection) -> list[dict]:
+def _get_open_holds(conn) -> list[dict]:
     """All holds that can still receive a matching reply -- both
     'Awaiting Reply' and 'Past Follow-Up' are open (the latter is just
     overdue, not closed); only 'Resolved' holds are excluded. Includes
     sent_message_id/status, which the other row-fetching functions in
     this module don't need."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, order_id, customer_email, inbound_sender, inbound_subject, "
@@ -242,7 +235,6 @@ def _get_open_holds(get_connection) -> list[dict]:
         "FROM hold_requests WHERE status IN ('Awaiting Reply', 'Past Follow-Up')"
     )
     rows = cursor.fetchall()
-    conn.close()
     return [
         {
             "id": r[0], "order_id": r[1], "customer_email": r[2],
@@ -254,19 +246,19 @@ def _get_open_holds(get_connection) -> list[dict]:
     ]
 
 
-def get_open_holds_for_sender(get_connection, customer_email: str) -> list[dict]:
+def get_open_holds_for_sender(conn, customer_email: str) -> list[dict]:
     """Open holds whose customer_email matches, case-insensitive -- the
     Layer 3 sender-fallback query, also reused to show candidates in the
     Needs Manual Linking UI when Layer 3 alone can't disambiguate."""
     email_lower = (customer_email or "").strip().lower()
     return [
-        h for h in _get_open_holds(get_connection)
+        h for h in _get_open_holds(conn)
         if h["customer_email"].strip().lower() == email_lower
     ]
 
 
 def match_reply_to_hold(
-    get_connection,
+    conn,
     sender_email: str,
     subject: str,
     body: str,
@@ -282,7 +274,7 @@ def match_reply_to_hold(
     Never guesses: Layer 3 only returns a match when exactly one open
     Hold belongs to the sender. More than one is handed to a human via
     the "ambiguous" status (Layer 4 -- see queue_for_manual_linking)."""
-    open_holds = _get_open_holds(get_connection)
+    open_holds = _get_open_holds(conn)
     if not open_holds:
         return {"status": "no_match"}
 
@@ -322,13 +314,12 @@ def match_reply_to_hold(
     return {"status": "no_match"}
 
 
-def queue_for_manual_linking(get_connection, item: dict):
+def queue_for_manual_linking(conn, item: dict):
     """Moves an ambiguous inbound email (Layer 3 found more than one open
     Hold for the same sender) into the manual-linking queue instead of
     guessing -- a human picks the right Hold in the dashboard. `item` is
     the same dict shape as a pending_emails row (uid/sender/subject/body/
     in_reply_to/references)."""
-    conn = get_connection()
     cursor = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
     cursor.execute(
@@ -342,20 +333,17 @@ def queue_for_manual_linking(get_connection, item: dict):
         ),
     )
     conn.commit()
-    conn.close()
 
 
-def get_manual_linking_emails(get_connection) -> list[dict]:
+def get_manual_linking_emails(conn) -> list[dict]:
     """Emails currently awaiting a human decision on which open Hold
     they reply to, oldest-flagged first."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT uid, sender, subject, body, in_reply_to, references_header, fetched_at "
         "FROM manual_linking_emails ORDER BY flagged_at"
     )
     rows = cursor.fetchall()
-    conn.close()
     return [
         {
             "uid": r[0], "sender": r[1], "subject": r[2], "body": r[3],
@@ -365,22 +353,19 @@ def get_manual_linking_emails(get_connection) -> list[dict]:
     ]
 
 
-def remove_from_manual_linking(get_connection, uid: str):
+def remove_from_manual_linking(conn, uid: str):
     """Called once a human has resolved the ambiguity -- either by
     linking to a specific Hold or choosing to treat the email as a
     brand-new request."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM manual_linking_emails WHERE uid = ?", (uid,))
     conn.commit()
-    conn.close()
 
 
-def get_holds_due_for_follow_up(get_connection) -> list[dict]:
+def get_holds_due_for_follow_up(conn) -> list[dict]:
     """Holds where FOLLOW_UP_WINDOW_MINUTES have passed with status
-    still 'Awaiting Reply'. This is what the scheduled job (not yet
-    built) will call to decide who needs a follow-up email drafted."""
-    conn = get_connection()
+    still 'Awaiting Reply'. This is what the scheduled job calls to
+    decide who needs a follow-up email drafted."""
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, order_id, customer_email, inbound_sender, inbound_subject, "
@@ -388,7 +373,6 @@ def get_holds_due_for_follow_up(get_connection) -> list[dict]:
         "FROM hold_requests WHERE status = 'Awaiting Reply'"
     )
     rows = cursor.fetchall()
-    conn.close()
 
     now = datetime.now(timezone.utc)
     due = []
@@ -400,14 +384,13 @@ def get_holds_due_for_follow_up(get_connection) -> list[dict]:
     return due
 
 
-def mark_follow_up_sent(get_connection, hold_id: int, follow_up_body: str):
+def mark_follow_up_sent(conn, hold_id: int, follow_up_body: str):
     """Called after a follow-up email has been drafted (and, per the
     approval-gate design, only actually sent once a human approves it
     via outbound_email.approve_and_send). This just records that the
     follow-up step happened and flips status to 'Past Follow-Up' so
     the dashboard surfaces it for human attention -- it does NOT
     change anything about the underlying order."""
-    conn = get_connection()
     cursor = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
     cursor.execute(
@@ -416,18 +399,15 @@ def mark_follow_up_sent(get_connection, hold_id: int, follow_up_body: str):
         (follow_up_body, now, hold_id),
     )
     conn.commit()
-    conn.close()
 
 
-def resolve_hold(get_connection, hold_id: int):
+def resolve_hold(conn, hold_id: int):
     """Marks a hold as resolved -- called when a human has dealt with
     it (customer replied and it got reprocessed, order was cancelled,
     etc). This is a manual/explicit action, never automatic."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE hold_requests SET status = 'Resolved' WHERE id = ?",
         (hold_id,),
     )
     conn.commit()
-    conn.close()

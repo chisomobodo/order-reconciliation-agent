@@ -42,7 +42,7 @@ IMAP_HOST = "imap.gmail.com"
 
 # ---------------------------------------------------------------------
 # Schema (call once at app startup, alongside auth.init_auth_schema --
-# same get_connection()/is_azure pattern, same database)
+# same conn/is_azure pattern, same database)
 # ---------------------------------------------------------------------
 
 SQLITE_SCHEMA = """
@@ -114,10 +114,10 @@ def _ensure_column(cursor, is_azure: bool, table: str, column: str, sqlite_type:
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sqlite_type}")
 
 
-def init_email_tracking_schema(get_connection, is_azure: bool):
+def init_email_tracking_schema(conn, is_azure: bool):
     """Creates the pending_emails/processed_emails tables if they don't
-    exist. Call this once alongside auth.init_auth_schema."""
-    conn = get_connection()
+    exist. Call this once alongside auth.init_auth_schema. Takes an
+    already-open connection -- caller owns its lifecycle."""
     cursor = conn.cursor()
     schema = AZURE_SQL_SCHEMA if is_azure else SQLITE_SCHEMA
     if is_azure:
@@ -131,24 +131,23 @@ def init_email_tracking_schema(get_connection, is_azure: bool):
     _ensure_column(cursor, is_azure, "pending_emails", "in_reply_to", "TEXT", "NVARCHAR(998)")
     _ensure_column(cursor, is_azure, "pending_emails", "references_header", "TEXT", "NVARCHAR(MAX)")
     conn.commit()
-    conn.close()
 
 
 # ---------------------------------------------------------------------
 # Pending / processed email tracking
 # ---------------------------------------------------------------------
 
-def sync_fetched_emails(get_connection, fetched: list[dict]) -> int:
+def sync_fetched_emails(conn, fetched: list[dict]) -> int:
     """Inserts each newly-fetched email into pending_emails, skipping
     any uid already present in EITHER pending_emails or processed_emails.
     That dedup is what makes "Check Inbox" always safe to click
     repeatedly -- it can never duplicate an email still awaiting
     processing, and can never resurrect one already processed. Returns
-    the number of genuinely new emails inserted."""
+    the number of genuinely new emails inserted. Takes an already-open
+    connection -- caller owns its lifecycle."""
     if not fetched:
         return 0
 
-    conn = get_connection()
     cursor = conn.cursor()
     inserted = 0
     now = datetime.now(timezone.utc).isoformat()
@@ -171,23 +170,20 @@ def sync_fetched_emails(get_connection, fetched: list[dict]) -> int:
         inserted += 1
 
     conn.commit()
-    conn.close()
     return inserted
 
 
-def get_pending_emails(get_connection) -> list[dict]:
+def get_pending_emails(conn) -> list[dict]:
     """Returns the current pending_emails contents, oldest fetched
     first -- queried fresh from the database every call, not cached, so
     it's correct regardless of which browser session originally fetched
     an email and survives a page refresh."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT uid, sender, subject, body, in_reply_to, references_header, fetched_at "
         "FROM pending_emails ORDER BY fetched_at"
     )
     rows = cursor.fetchall()
-    conn.close()
     return [
         {
             "uid": r[0], "sender": r[1], "subject": r[2], "body": r[3],
@@ -197,30 +193,26 @@ def get_pending_emails(get_connection) -> list[dict]:
     ]
 
 
-def remove_pending_email(get_connection, uid: str):
+def remove_pending_email(conn, uid: str):
     """Removes a pending email WITHOUT moving it to processed_emails --
     used when hold_requests.match_reply_to_hold() finds it ambiguous
     (more than one open Hold from the same sender): the email moves into
     the manual-linking queue instead (hold_requests.
     queue_for_manual_linking), to be processed later once a human picks
     the right Hold."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM pending_emails WHERE uid = ?", (uid,))
     conn.commit()
-    conn.close()
 
 
-def get_processed_emails(get_connection) -> list[dict]:
+def get_processed_emails(conn) -> list[dict]:
     """Returns the processed_emails log, most recently processed first."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT uid, sender, subject, final_status, processed_at FROM processed_emails "
         "ORDER BY processed_at DESC"
     )
     rows = cursor.fetchall()
-    conn.close()
     return [
         {"uid": r[0], "sender": r[1], "subject": r[2], "final_status": r[3], "processed_at": r[4]}
         for r in rows
@@ -228,7 +220,7 @@ def get_processed_emails(get_connection) -> list[dict]:
 
 
 def record_processed_email(
-    get_connection,
+    conn,
     uid: str,
     sender: str,
     subject: str,
@@ -243,8 +235,8 @@ def record_processed_email(
     mark_processed(uid) separately; keeping the DB move and the IMAP
     flag as two explicit steps mirrors how commit_order_modification and
     email_ingestion.mark_processed are already kept as separate,
-    deliberate actions elsewhere in this project."""
-    conn = get_connection()
+    deliberate actions elsewhere in this project. Takes an already-open
+    connection -- caller owns its lifecycle."""
     cursor = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
     cursor.execute(
@@ -255,7 +247,6 @@ def record_processed_email(
     )
     cursor.execute("DELETE FROM pending_emails WHERE uid = ?", (uid,))
     conn.commit()
-    conn.close()
 
 
 def _decode_mime_words(value: str) -> str:

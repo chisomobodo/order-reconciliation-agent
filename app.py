@@ -12,6 +12,7 @@ import html
 import json
 import os
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr, make_msgid
 
@@ -144,13 +145,12 @@ STARTUP_DB_RETRY_DELAY_S = 1.5
 
 
 def _connect_with_retry():
-    """Drop-in replacement for auth_get_connection, passed as the
-    get_connection argument to each schema-init function below so their
-    own internal `conn = get_connection()` call transparently gets retry
-    behavior with no changes needed in auth.py/email_ingestion.py/
-    outbound_email.py/hold_requests.py themselves. Harmless for local
-    SQLite too -- sqlite3.connect() doesn't fail on a cold start, so the
-    loop just succeeds on the first attempt every time."""
+    """Drop-in replacement for calling auth_get_connection() directly --
+    used by each _ensure_*_schema() function below to get an open
+    connection with retry behavior, before passing it into the
+    corresponding init_*_schema(conn, is_azure=...) call. Harmless for
+    local SQLite too -- sqlite3.connect() doesn't fail on a cold start,
+    so the loop just succeeds on the first attempt every time."""
     last_error = None
     for attempt in range(1, STARTUP_DB_MAX_ATTEMPTS + 1):
         try:
@@ -166,8 +166,12 @@ def _connect_with_retry():
 def _ensure_auth_schema():
     """Runs once for the life of the process (st.cache_resource, not
     cache_data -- this is setup, not data), alongside the ERP tables in
-    the same database."""
-    auth.init_auth_schema(_connect_with_retry, is_azure=USE_AZURE_DB)
+    the same database. Opens its own single retry-wrapped connection --
+    init_auth_schema() now takes an already-open conn rather than a
+    connection-opening callable, matching every other DB-touching
+    function in the project after the get_connection -> conn refactor."""
+    with closing(_connect_with_retry()) as conn:
+        auth.init_auth_schema(conn, is_azure=USE_AZURE_DB)
     return True
 
 
@@ -175,7 +179,8 @@ def _ensure_auth_schema():
 def _ensure_email_tracking_schema():
     """Same pattern as _ensure_auth_schema -- pending_emails/
     processed_emails live in the same database, created once per process."""
-    email_ingestion.init_email_tracking_schema(_connect_with_retry, is_azure=USE_AZURE_DB)
+    with closing(_connect_with_retry()) as conn:
+        email_ingestion.init_email_tracking_schema(conn, is_azure=USE_AZURE_DB)
     return True
 
 
@@ -183,7 +188,8 @@ def _ensure_email_tracking_schema():
 def _ensure_outbound_email_schema():
     """Same pattern again -- outbound_emails (the send-approval queue)
     lives in the same database, created once per process."""
-    outbound_email.init_outbound_email_schema(_connect_with_retry, is_azure=USE_AZURE_DB)
+    with closing(_connect_with_retry()) as conn:
+        outbound_email.init_outbound_email_schema(conn, is_azure=USE_AZURE_DB)
     return True
 
 
@@ -192,7 +198,8 @@ def _ensure_hold_requests_schema():
     """Same pattern again -- hold_requests (orders paused on a
     clarifying question) lives in the same database, created once per
     process."""
-    hold_requests.init_hold_requests_schema(_connect_with_retry, is_azure=USE_AZURE_DB)
+    with closing(_connect_with_retry()) as conn:
+        hold_requests.init_hold_requests_schema(conn, is_azure=USE_AZURE_DB)
     return True
 
 
@@ -304,7 +311,11 @@ else:
 # Validated on every single rerun, not just once -- this is what actually
 # enforces the sliding 20-minute inactivity window (each call refreshes
 # last_active_at) rather than trusting a stale login forever.
-_session_check = auth.validate_session(auth_get_connection, _session_token) if _session_token else {"status": "Invalid"}
+if _session_token:
+    with closing(auth_get_connection()) as _conn:
+        _session_check = auth.validate_session(_conn, _session_token)
+else:
+    _session_check = {"status": "Invalid"}
 
 if _session_check.get("status") == "Valid":
     st.session_state.session_token = _session_token
@@ -357,7 +368,8 @@ def _render_auth_screen():
                     login_password = st.text_input("Password", type="password", key="login_password")
                     submitted = st.form_submit_button("Send login code", type="primary", use_container_width=True)
                 if submitted:
-                    result = auth.request_login_code(auth_get_connection, login_email.strip(), login_password)
+                    with closing(auth_get_connection()) as _conn:
+                        result = auth.request_login_code(_conn, login_email.strip(), login_password)
                     if result.get("status") == "Success":
                         st.session_state.login_user_id = result["user_id"]
                         st.session_state.login_step = "code"
@@ -380,7 +392,8 @@ def _render_auth_screen():
                     restart_clicked = st.form_submit_button("Start over", type="secondary")
 
                 if verify_clicked:
-                    result = auth.verify_login_code(auth_get_connection, st.session_state.login_user_id, code, is_azure=USE_AZURE_DB)
+                    with closing(auth_get_connection()) as _conn:
+                        result = auth.verify_login_code(_conn, st.session_state.login_user_id, code, is_azure=USE_AZURE_DB)
                     if result.get("status") == "Success":
                         session_token = result["session_token"]
                         # Constructed here rather than at module scope --
@@ -435,7 +448,8 @@ def _render_auth_screen():
                 signup_password = st.text_input("Password", type="password", key="signup_password")
                 submitted = st.form_submit_button("Create account", type="primary", use_container_width=True)
             if submitted:
-                result = auth.sign_up(auth_get_connection, signup_email.strip(), signup_name.strip(), signup_password)
+                with closing(auth_get_connection()) as _conn:
+                    result = auth.sign_up(_conn, signup_email.strip(), signup_name.strip(), signup_password)
                 kind = "success" if result.get("status") == "Success" else "error"
                 st.session_state.signup_message = (result["message"], kind)
                 st.rerun()
@@ -488,7 +502,7 @@ def _build_combined_context(hold: dict, new_reply_body: str) -> str:
     )
 
 
-def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, matched_hold: dict | None = None):
+def _run_agent_and_dispatch(conn, agent_input: str, item: dict, sender_address: str, matched_hold: dict | None = None):
     """Core of processing one inbound email through the agent -- shared
     by a brand-new pending email (matched_hold=None), a reply
     automatically matched to an open Hold (Layers 1-3), and a reply a
@@ -499,6 +513,12 @@ def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, m
     use the real, individual inbound email's own fields, so the
     processed-email log reflects what actually arrived, not the
     constructed context.
+
+    Takes an already-open connection, used for every DB-touching call
+    made while handling this one action (run_agent's internal tool
+    calls, the Hold/outbound-draft writes, and the final processed-email
+    move) -- caller owns its lifecycle. This is what keeps a single
+    "Process" click down to one Azure SQL connection instead of five-plus.
 
     Updates st.session_state.last_result with the outcome, so the
     "Agent Execution" panel shows this result in place of whatever was
@@ -512,7 +532,7 @@ def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, m
     retried rather than silently lost to a transient failure (e.g. a
     dropped Claude API call)."""
     try:
-        tool_log, final_result, reply = run_agent(agent_input)
+        tool_log, final_result, reply = run_agent(conn, agent_input)
     except Exception as e:
         st.session_state.last_result = {"error": str(e)}
         return
@@ -538,9 +558,9 @@ def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, m
         # normal reply, and the original Hold is marked resolved since
         # the conversation has moved forward (flagged as a known
         # limitation, not silently expanded here -- see README).
-        hold_requests.resolve_hold(auth_get_connection, matched_hold["id"])
+        hold_requests.resolve_hold(conn, matched_hold["id"])
         outbound_email.queue_draft(
-            auth_get_connection,
+            conn,
             to_email=sender_address,
             subject=f"Re: {item['subject']}",
             body=reply,
@@ -559,7 +579,7 @@ def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, m
         # In-Reply-To/References ever gets stripped by a mail client.
         sent_message_id = make_msgid()
         hold_result = hold_requests.create_hold(
-            auth_get_connection,
+            conn,
             order_id=clarification_request["order_id"],
             customer_email=sender_address,
             inbound_sender=item["sender"],
@@ -570,7 +590,7 @@ def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, m
         )
         hold_id = hold_result["hold_id"]
         outbound_email.queue_draft(
-            auth_get_connection,
+            conn,
             to_email=sender_address,
             subject=f"Re: {item['subject']} [HOLD-{hold_id}]",
             body=(
@@ -587,7 +607,7 @@ def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, m
         # writes, now extended to outbound email. Every drafted reply is
         # queued here, regardless of outcome.
         outbound_email.queue_draft(
-            auth_get_connection,
+            conn,
             to_email=sender_address,
             subject=f"Re: {item['subject']}",
             body=reply,
@@ -600,7 +620,7 @@ def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, m
 
     if final_result and final_result.get("status") == "Success" and verified_change:
         if st.session_state.auto_approve:
-            commit_result = commit_order_modification(**verified_change)
+            commit_result = commit_order_modification(conn, **verified_change)
             if commit_result.get("status") == "Success":
                 st.cache_data.clear()
                 st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
@@ -624,7 +644,7 @@ def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, m
     final_status = final_result.get("status", "?") if final_result else "No Action"
 
     email_ingestion.record_processed_email(
-        auth_get_connection,
+        conn,
         uid=item["uid"],
         sender=item["sender"],
         subject=item["subject"],
@@ -636,7 +656,7 @@ def _run_agent_and_dispatch(agent_input: str, item: dict, sender_address: str, m
     email_ingestion.mark_processed(item["uid"])
 
 
-def _process_pending_email(item):
+def _process_pending_email(conn, item):
     """Entry point for a normal pending-inbox email (the "Process" /
     "Process All" buttons). Before treating it as a new request, checks
     it against open Holds via hold_requests.match_reply_to_hold() -- see
@@ -644,11 +664,15 @@ def _process_pending_email(item):
     "ambiguous" result (Layer 3 found more than one open Hold for this
     sender) is never guessed at: the email is moved into the
     manual-linking queue for a human to resolve instead of being
-    processed here."""
+    processed here.
+
+    Takes an already-open connection -- caller owns its lifecycle. When
+    called in a loop ("Process All"), the SAME connection is reused
+    across every email in the batch rather than one per email."""
     sender_address = parseaddr(item["sender"])[1] or item["sender"]
 
     match_result = hold_requests.match_reply_to_hold(
-        auth_get_connection,
+        conn,
         sender_email=sender_address,
         subject=item["subject"],
         body=item["body"],
@@ -657,13 +681,13 @@ def _process_pending_email(item):
     )
 
     if match_result["status"] == "ambiguous":
-        hold_requests.queue_for_manual_linking(auth_get_connection, item)
-        email_ingestion.remove_pending_email(auth_get_connection, item["uid"])
+        hold_requests.queue_for_manual_linking(conn, item)
+        email_ingestion.remove_pending_email(conn, item["uid"])
         return
 
     matched_hold = match_result.get("hold")
     agent_input = _build_combined_context(matched_hold, item["body"]) if matched_hold else item["body"]
-    _run_agent_and_dispatch(agent_input, item, sender_address, matched_hold=matched_hold)
+    _run_agent_and_dispatch(conn, agent_input, item, sender_address, matched_hold=matched_hold)
 
 
 def db_mode_badge_html(mode: str, has_error: bool) -> str:
@@ -779,7 +803,8 @@ with user_col:
         )
     with logout_col:
         if st.button("Log out", type="secondary", use_container_width=True):
-            auth.log_out(auth_get_connection, st.session_state.get("session_token"))
+            with closing(auth_get_connection()) as _conn:
+                auth.log_out(_conn, st.session_state.get("session_token"))
             # Not cookie_manager.delete() -- it does `del self.cookies[cookie]`
             # internally, which raises KeyError whenever that key isn't
             # already present in the manager's local dict (e.g. if the
@@ -807,9 +832,241 @@ with user_col:
 st.write("")
 
 # --- Main layout ---
-col1, col2 = st.columns(2)
+# Reorganized into tabs (pure layout change -- same widgets, same keys,
+# same session_state, same function calls as before; only the physical
+# grouping changed, from two side-by-side columns holding everything to
+# five topic tabs). The header row above and the sidebar (Live ERP
+# State) stay exactly where they were -- always visible regardless of
+# which tab is active.
+tab_process, tab_inbox, tab_outbound, tab_hold, tab_history = st.tabs(
+    ["Process Email", "Inbox", "Outbound Queue", "On Hold", "History"]
+)
 
-with col1:
+with tab_process:
+    pe_col1, pe_col2 = st.columns(2)
+
+    with pe_col1:
+        sample_emails = load_sample_emails()
+
+        if sample_emails:
+            options = ["-- Write your own --"] + [
+                f"[{e['category']}] {e['id']} — {e['subject']}" for e in sample_emails
+            ]
+            choice = st.selectbox("Pick a test case, or write your own:", options)
+
+            if choice == "-- Write your own --":
+                email_body = st.text_area("Email content:", height=200, placeholder="Paste or type a customer email here...")
+                original_subject = "Your Order"
+            else:
+                idx = options.index(choice) - 1
+                email_body = st.text_area("Email content:", value=sample_emails[idx]["body"], height=200)
+                original_subject = sample_emails[idx]["subject"]
+        else:
+            st.info("No sample_emails.json found — run generate_test_emails.py first for pre-built test cases.")
+            email_body = st.text_area("Email content:", height=200, placeholder="Paste or type a customer email here...")
+            original_subject = "Your Order"
+
+        # Manually pasted/typed emails have no "From" header to draw a reply
+        # address from (unlike ingested emails, which do) -- required so the
+        # drafted reply can actually be queued for approval below.
+        sender_email = st.text_input(
+            "Sender's email address:",
+            placeholder="customer@example.com",
+            key="manual_sender_email",
+        )
+
+        run_clicked = st.button(
+            "Process with Agent",
+            type="primary",
+            disabled=not email_body.strip() or not sender_email.strip() or bool(DB_INIT_ERROR),
+        )
+
+    with pe_col2:
+        st.subheader("Agent Execution")
+
+        if run_clicked:
+            with st.spinner("Agent reasoning and calling tools..."):
+                try:
+                    # One connection for this whole action -- run_agent's
+                    # internal tool calls (get_order_details, verify_order_
+                    # modification), the Hold/outbound-draft writes, and
+                    # the optional auto-approve commit all share it,
+                    # instead of each opening (and paying the Azure SQL
+                    # handshake cost for) its own.
+                    with closing(auth_get_connection()) as conn:
+                        tool_log, final_result, reply = run_agent(conn, email_body)
+                        # Persist to session_state so this survives the
+                        # st.rerun() below (used to refresh the sidebar
+                        # tables) instead of vanishing the moment the
+                        # script re-executes.
+                        st.session_state.last_result = {
+                            "tool_log": tool_log,
+                            "final_result": final_result,
+                            "reply": reply,
+                        }
+                        # A fresh run supersedes whatever approval state
+                        # was left over from the previous email.
+                        st.session_state.pending_approval = None
+                        st.session_state.last_commit_result = None
+
+                        verified_change = find_verified_change(tool_log) if tool_log else None
+                        clarification_request = find_clarification_request(tool_log) if tool_log else None
+
+                        # Queue the drafted reply for human approval
+                        # before it's ever sent -- same check/commit-style
+                        # gate already used for database writes, now
+                        # extended to outbound email. This must run
+                        # BEFORE the st.rerun() below (which only fires
+                        # for a verified change), so it happens for every
+                        # outcome -- including a clarification question,
+                        # which still needs to reach the customer.
+                        #
+                        # If this was a clarification request AND an
+                        # order ID was actually given, place that order
+                        # on hold so it isn't silently lost while waiting
+                        # on the customer's reply -- see hold_requests.py
+                        # / CLAUDE.md "Hold state design". The Message-ID
+                        # is generated here, BEFORE the email is actually
+                        # sent (sending is gated behind human approval),
+                        # stored on the Hold now, and passed through to
+                        # queue_draft() so approve_and_send() can set it
+                        # as the real outgoing Message-ID header once
+                        # approved -- this is what lets a real reply to
+                        # this question (ingested later via IMAP) be
+                        # matched back automatically. The HOLD-{id} tag in
+                        # the subject/body is a fallback in case
+                        # In-Reply-To/References ever gets stripped. No
+                        # order ID -> nothing to hold; just queue the
+                        # clarification email normally.
+                        if clarification_request and clarification_request.get("order_id"):
+                            sent_message_id = make_msgid()
+                            hold_result = hold_requests.create_hold(
+                                conn,
+                                order_id=clarification_request["order_id"],
+                                customer_email=sender_email.strip(),
+                                inbound_sender=sender_email.strip(),
+                                inbound_subject=original_subject,
+                                inbound_body=email_body,
+                                clarifying_question_sent=reply,
+                                sent_message_id=sent_message_id,
+                            )
+                            hold_id = hold_result["hold_id"]
+                            outbound_email.queue_draft(
+                                conn,
+                                to_email=sender_email.strip(),
+                                subject=f"Re: {original_subject} [HOLD-{hold_id}]",
+                                body=(
+                                    f"{reply}\n\n"
+                                    f"To help us match your reply to the right request, please keep "
+                                    f"the reference HOLD-{hold_id} somewhere in your reply."
+                                ),
+                                message_id=sent_message_id,
+                                context_note=f"Order {clarification_request['order_id']}",
+                            )
+                        else:
+                            outbound_email.queue_draft(
+                                conn,
+                                to_email=sender_email.strip(),
+                                subject=f"Re: {original_subject}",
+                                body=reply,
+                                context_note=(
+                                    f"Order {verified_change['order_id']}" if verified_change
+                                    else (final_result.get("status") if final_result else "No Action")
+                                ),
+                            )
+
+                        if final_result and final_result.get("status") == "Success" and verified_change:
+                            if st.session_state.auto_approve:
+                                commit_result = commit_order_modification(conn, **verified_change)
+                                st.session_state.last_commit_result = commit_result
+                                if commit_result.get("status") == "Success":
+                                    st.cache_data.clear()  # sidebar shouldn't show the pre-write snapshot
+                                    st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
+                                else:
+                                    st.toast(f"Auto-approve commit failed: {commit_result.get('message')}", icon="⚠️")
+                            else:
+                                st.session_state.pending_approval = verified_change
+                            st.rerun()
+                except Exception as e:
+                    st.session_state.last_result = {"error": str(e)}
+
+        if "last_result" in st.session_state:
+            result = st.session_state.last_result
+
+            if "error" in result:
+                st.error(f"Agent error: {result['error']}")
+            else:
+                tool_log = result["tool_log"]
+                final_result = result["final_result"]
+                reply = result["reply"]
+
+                st.markdown("**Tool Call Chain**")
+                if not tool_log:
+                    st.markdown(stamp_html("No Action"), unsafe_allow_html=True)
+                    st.caption("Claude replied without taking any action.")
+                else:
+                    for i, call in enumerate(tool_log, 1):
+                        status = call["result"].get("status", "?")
+                        detail_lines = [f"{k}: {v}" for k, v in call["inputs"].items()]
+                        detail_lines.append(f"→ {status}")
+                        detail = "\n".join(detail_lines)
+                        st.markdown(
+                            step_card_html(i, call["tool_called"], status, detail, delay_s=(i - 1) * 0.12),
+                            unsafe_allow_html=True,
+                        )
+
+                final_status = final_result.get("status", "?") if final_result else "No Action"
+
+                st.markdown("**Outcome**")
+                st.markdown(stamp_html(final_status), unsafe_allow_html=True)
+
+                st.markdown("**Reply to Customer**")
+                st.markdown(f'<div class="reply-card">{reply}</div>', unsafe_allow_html=True)
+
+                # --- Human approval gate for the database write ---
+                if st.session_state.pending_approval:
+                    pending = st.session_state.pending_approval
+                    st.markdown("**Database Write**")
+                    st.markdown(stamp_html("Pending Approval"), unsafe_allow_html=True)
+                    st.markdown(
+                        f"""<div class="reply-card">
+                        Order: <b>{pending['order_id']}</b><br>
+                        SKU: <b>{pending['mapped_sku']}</b><br>
+                        New quantity: <b>{pending['requested_quantity']}</b>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+                    approve_col, reject_col = st.columns(2)
+                    with approve_col:
+                        if st.button("✅ Approve & Apply", type="primary", use_container_width=True):
+                            with closing(auth_get_connection()) as conn:
+                                commit_result = commit_order_modification(conn, **pending)
+                            st.session_state.last_commit_result = commit_result
+                            st.session_state.pending_approval = None
+                            if commit_result.get("status") == "Success":
+                                st.cache_data.clear()  # sidebar shouldn't show the pre-write snapshot
+                                st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
+                            else:
+                                st.toast(f"Commit failed: {commit_result.get('message')}", icon="⚠️")
+                            st.rerun()
+                    with reject_col:
+                        if st.button("❌ Reject", use_container_width=True):
+                            st.session_state.pending_approval = None
+                            st.session_state.last_commit_result = {
+                                "status": "Rejected by Reviewer",
+                                "message": "Change discarded by reviewer — no database write performed.",
+                            }
+                            st.rerun()
+                elif st.session_state.last_commit_result:
+                    commit_result = st.session_state.last_commit_result
+                    st.markdown("**Database Write**")
+                    st.markdown(stamp_html(commit_result.get("status", "?")), unsafe_allow_html=True)
+                    st.caption(commit_result.get("message", ""))
+
+        if not run_clicked and "last_result" not in st.session_state:
+            st.info("Select or write an email on the left, then click **Process with Agent**.")
+
+with tab_inbox:
     st.subheader("Inbound Email")
 
     st.caption(f"Real customer emails, pulled from Gmail's \"{email_ingestion.IMAP_LABEL}\" label.")
@@ -836,7 +1093,8 @@ with col1:
                 st.session_state.fetch_error = str(e)
             else:
                 st.session_state.fetch_error = None
-                inserted = email_ingestion.sync_fetched_emails(auth_get_connection, fetched)
+                with closing(auth_get_connection()) as conn:
+                    inserted = email_ingestion.sync_fetched_emails(conn, fetched)
                 st.toast(
                     f"Found {inserted} new email(s)." if inserted else "No new emails found.",
                     icon="📥",
@@ -848,47 +1106,52 @@ with col1:
 
     # Queried fresh from the database on every render, not session state
     # -- correct regardless of which browser session originally fetched
-    # an email, and survives a page refresh.
-    pending_emails = email_ingestion.get_pending_emails(auth_get_connection)
+    # an email, and survives a page refresh. Reuses one connection for
+    # both the read and (if Process/Process All was clicked) the whole
+    # processing pass below -- a "Process All" batch of N emails used to
+    # open a fresh connection for every one of N x several DB calls each;
+    # now it's one connection for the entire click.
+    with closing(auth_get_connection()) as conn:
+        pending_emails = email_ingestion.get_pending_emails(conn)
 
-    if pending_emails:
-        st.markdown(f"**{len(pending_emails)} email(s) pending processing:**")
-        process_all_clicked = st.button(
-            "▶️ Process All",
-            type="primary",
-            use_container_width=True,
-            key="process_all_ingested",
-        )
-
-        process_this_uid = None
-        for i, item in enumerate(pending_emails, 1):
-            preview = item["body"][:300] + ("…" if len(item["body"]) > 300 else "")
-            st.markdown(
-                email_card_html(
-                    i,
-                    html.escape(item["sender"]),
-                    html.escape(item["subject"]),
-                    html.escape(preview),
-                    delay_s=(i - 1) * 0.08,
-                ),
-                unsafe_allow_html=True,
+        if pending_emails:
+            st.markdown(f"**{len(pending_emails)} email(s) pending processing:**")
+            process_all_clicked = st.button(
+                "▶️ Process All",
+                type="primary",
+                use_container_width=True,
+                key="process_all_ingested",
             )
-            if st.button("Process", key=f"process_ingested_{item['uid']}"):
-                process_this_uid = item["uid"]
 
-        # Only one of these can actually be true on any given run --
-        # Streamlit only reports a click for the specific widget that was
-        # clicked -- so there's no risk of double-processing here.
-        if process_all_clicked:
-            for item in pending_emails:
-                _process_pending_email(item)
-            st.rerun()
-        elif process_this_uid:
-            item = next(e for e in pending_emails if e["uid"] == process_this_uid)
-            _process_pending_email(item)
-            st.rerun()
-    else:
-        st.caption("No emails currently pending processing.")
+            process_this_uid = None
+            for i, item in enumerate(pending_emails, 1):
+                preview = item["body"][:300] + ("…" if len(item["body"]) > 300 else "")
+                st.markdown(
+                    email_card_html(
+                        i,
+                        html.escape(item["sender"]),
+                        html.escape(item["subject"]),
+                        html.escape(preview),
+                        delay_s=(i - 1) * 0.08,
+                    ),
+                    unsafe_allow_html=True,
+                )
+                if st.button("Process", key=f"process_ingested_{item['uid']}"):
+                    process_this_uid = item["uid"]
+
+            # Only one of these can actually be true on any given run --
+            # Streamlit only reports a click for the specific widget that
+            # was clicked -- so there's no risk of double-processing here.
+            if process_all_clicked:
+                for item in pending_emails:
+                    _process_pending_email(conn, item)
+                st.rerun()
+            elif process_this_uid:
+                item = next(e for e in pending_emails if e["uid"] == process_this_uid)
+                _process_pending_email(conn, item)
+                st.rerun()
+        else:
+            st.caption("No emails currently pending processing.")
 
     if st.session_state.pending_approval_queue:
         pending = st.session_state.pending_approval_queue[0]
@@ -911,11 +1174,13 @@ with col1:
         ingest_approve_col, ingest_reject_col = st.columns(2)
         with ingest_approve_col:
             if st.button("✅ Approve & Apply", type="primary", use_container_width=True, key="ingest_approve"):
-                commit_result = commit_order_modification(
-                    order_id=pending["order_id"],
-                    mapped_sku=pending["mapped_sku"],
-                    requested_quantity=pending["requested_quantity"],
-                )
+                with closing(auth_get_connection()) as conn:
+                    commit_result = commit_order_modification(
+                        conn,
+                        order_id=pending["order_id"],
+                        mapped_sku=pending["mapped_sku"],
+                        requested_quantity=pending["requested_quantity"],
+                    )
                 st.session_state.pending_approval_queue.pop(0)
                 if commit_result.get("status") == "Success":
                     st.cache_data.clear()
@@ -929,220 +1194,15 @@ with col1:
                 st.toast("Change discarded.", icon="🚫")
                 st.rerun()
 
-    st.divider()
-
-    sample_emails = load_sample_emails()
-
-    if sample_emails:
-        options = ["-- Write your own --"] + [
-            f"[{e['category']}] {e['id']} — {e['subject']}" for e in sample_emails
-        ]
-        choice = st.selectbox("Pick a test case, or write your own:", options)
-
-        if choice == "-- Write your own --":
-            email_body = st.text_area("Email content:", height=200, placeholder="Paste or type a customer email here...")
-            original_subject = "Your Order"
-        else:
-            idx = options.index(choice) - 1
-            email_body = st.text_area("Email content:", value=sample_emails[idx]["body"], height=200)
-            original_subject = sample_emails[idx]["subject"]
-    else:
-        st.info("No sample_emails.json found — run generate_test_emails.py first for pre-built test cases.")
-        email_body = st.text_area("Email content:", height=200, placeholder="Paste or type a customer email here...")
-        original_subject = "Your Order"
-
-    # Manually pasted/typed emails have no "From" header to draw a reply
-    # address from (unlike ingested emails, which do) -- required so the
-    # drafted reply can actually be queued for approval below.
-    sender_email = st.text_input(
-        "Sender's email address:",
-        placeholder="customer@example.com",
-        key="manual_sender_email",
-    )
-
-    run_clicked = st.button(
-        "Process with Agent",
-        type="primary",
-        disabled=not email_body.strip() or not sender_email.strip() or bool(DB_INIT_ERROR),
-    )
-
-with col2:
-    st.subheader("Agent Execution")
-
-    if run_clicked:
-        with st.spinner("Agent reasoning and calling tools..."):
-            try:
-                tool_log, final_result, reply = run_agent(email_body)
-                # Persist to session_state so this survives the st.rerun()
-                # below (used to refresh the sidebar tables) instead of
-                # vanishing the moment the script re-executes.
-                st.session_state.last_result = {
-                    "tool_log": tool_log,
-                    "final_result": final_result,
-                    "reply": reply,
-                }
-                # A fresh run supersedes whatever approval state was left
-                # over from the previous email.
-                st.session_state.pending_approval = None
-                st.session_state.last_commit_result = None
-
-                verified_change = find_verified_change(tool_log) if tool_log else None
-                clarification_request = find_clarification_request(tool_log) if tool_log else None
-
-                # Queue the drafted reply for human approval before it's
-                # ever sent -- same check/commit-style gate already used
-                # for database writes, now extended to outbound email.
-                # This must run BEFORE the st.rerun() below (which only
-                # fires for a verified change), so it happens for every
-                # outcome -- including a clarification question, which
-                # still needs to reach the customer.
-                #
-                # If this was a clarification request AND an order ID was
-                # actually given, place that order on hold so it isn't
-                # silently lost while waiting on the customer's reply --
-                # see hold_requests.py / CLAUDE.md "Hold state design".
-                # The Message-ID is generated here, BEFORE the email is
-                # actually sent (sending is gated behind human approval),
-                # stored on the Hold now, and passed through to
-                # queue_draft() so approve_and_send() can set it as the
-                # real outgoing Message-ID header once approved -- this is
-                # what lets a real reply to this question (ingested later
-                # via IMAP) be matched back automatically. The HOLD-{id}
-                # tag in the subject/body is a fallback in case
-                # In-Reply-To/References ever gets stripped. No order ID
-                # -> nothing to hold; just queue the clarification email
-                # normally.
-                if clarification_request and clarification_request.get("order_id"):
-                    sent_message_id = make_msgid()
-                    hold_result = hold_requests.create_hold(
-                        auth_get_connection,
-                        order_id=clarification_request["order_id"],
-                        customer_email=sender_email.strip(),
-                        inbound_sender=sender_email.strip(),
-                        inbound_subject=original_subject,
-                        inbound_body=email_body,
-                        clarifying_question_sent=reply,
-                        sent_message_id=sent_message_id,
-                    )
-                    hold_id = hold_result["hold_id"]
-                    outbound_email.queue_draft(
-                        auth_get_connection,
-                        to_email=sender_email.strip(),
-                        subject=f"Re: {original_subject} [HOLD-{hold_id}]",
-                        body=(
-                            f"{reply}\n\n"
-                            f"To help us match your reply to the right request, please keep "
-                            f"the reference HOLD-{hold_id} somewhere in your reply."
-                        ),
-                        message_id=sent_message_id,
-                        context_note=f"Order {clarification_request['order_id']}",
-                    )
-                else:
-                    outbound_email.queue_draft(
-                        auth_get_connection,
-                        to_email=sender_email.strip(),
-                        subject=f"Re: {original_subject}",
-                        body=reply,
-                        context_note=(
-                            f"Order {verified_change['order_id']}" if verified_change
-                            else (final_result.get("status") if final_result else "No Action")
-                        ),
-                    )
-
-                if final_result and final_result.get("status") == "Success" and verified_change:
-                    if st.session_state.auto_approve:
-                        commit_result = commit_order_modification(**verified_change)
-                        st.session_state.last_commit_result = commit_result
-                        if commit_result.get("status") == "Success":
-                            st.cache_data.clear()  # sidebar shouldn't show the pre-write snapshot
-                            st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
-                        else:
-                            st.toast(f"Auto-approve commit failed: {commit_result.get('message')}", icon="⚠️")
-                    else:
-                        st.session_state.pending_approval = verified_change
-                    st.rerun()
-            except Exception as e:
-                st.session_state.last_result = {"error": str(e)}
-
-    if "last_result" in st.session_state:
-        result = st.session_state.last_result
-
-        if "error" in result:
-            st.error(f"Agent error: {result['error']}")
-        else:
-            tool_log = result["tool_log"]
-            final_result = result["final_result"]
-            reply = result["reply"]
-
-            st.markdown("**Tool Call Chain**")
-            if not tool_log:
-                st.markdown(stamp_html("No Action"), unsafe_allow_html=True)
-                st.caption("Claude replied without taking any action.")
-            else:
-                for i, call in enumerate(tool_log, 1):
-                    status = call["result"].get("status", "?")
-                    detail_lines = [f"{k}: {v}" for k, v in call["inputs"].items()]
-                    detail_lines.append(f"→ {status}")
-                    detail = "\n".join(detail_lines)
-                    st.markdown(
-                        step_card_html(i, call["tool_called"], status, detail, delay_s=(i - 1) * 0.12),
-                        unsafe_allow_html=True,
-                    )
-
-            final_status = final_result.get("status", "?") if final_result else "No Action"
-
-            st.markdown("**Outcome**")
-            st.markdown(stamp_html(final_status), unsafe_allow_html=True)
-
-            st.markdown("**Reply to Customer**")
-            st.markdown(f'<div class="reply-card">{reply}</div>', unsafe_allow_html=True)
-
-            # --- Human approval gate for the database write ---
-            if st.session_state.pending_approval:
-                pending = st.session_state.pending_approval
-                st.markdown("**Database Write**")
-                st.markdown(stamp_html("Pending Approval"), unsafe_allow_html=True)
-                st.markdown(
-                    f"""<div class="reply-card">
-                    Order: <b>{pending['order_id']}</b><br>
-                    SKU: <b>{pending['mapped_sku']}</b><br>
-                    New quantity: <b>{pending['requested_quantity']}</b>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-                approve_col, reject_col = st.columns(2)
-                with approve_col:
-                    if st.button("✅ Approve & Apply", type="primary", use_container_width=True):
-                        commit_result = commit_order_modification(**pending)
-                        st.session_state.last_commit_result = commit_result
-                        st.session_state.pending_approval = None
-                        if commit_result.get("status") == "Success":
-                            st.cache_data.clear()  # sidebar shouldn't show the pre-write snapshot
-                            st.toast("Order reconciled — inventory and order tables updated.", icon="✅")
-                        else:
-                            st.toast(f"Commit failed: {commit_result.get('message')}", icon="⚠️")
-                        st.rerun()
-                with reject_col:
-                    if st.button("❌ Reject", use_container_width=True):
-                        st.session_state.pending_approval = None
-                        st.session_state.last_commit_result = {
-                            "status": "Rejected by Reviewer",
-                            "message": "Change discarded by reviewer — no database write performed.",
-                        }
-                        st.rerun()
-            elif st.session_state.last_commit_result:
-                commit_result = st.session_state.last_commit_result
-                st.markdown("**Database Write**")
-                st.markdown(stamp_html(commit_result.get("status", "?")), unsafe_allow_html=True)
-                st.caption(commit_result.get("message", ""))
-
-    if not run_clicked and "last_result" not in st.session_state:
-        st.info("Select or write an email on the left, then click **Process with Agent**.")
-
-    st.divider()
+with tab_outbound:
     st.markdown("**📤 Pending Outbound Emails**")
     st.caption("Every drafted reply is queued here for approval before it's ever sent -- same gate as a database write.")
-    pending_drafts = outbound_email.get_pending_drafts(auth_get_connection)
+    # One connection for both read-only queries that render this tab
+    # (the pending queue and the sent-log audit trail below), instead of
+    # a separate connection for each.
+    with closing(auth_get_connection()) as conn:
+        pending_drafts = outbound_email.get_pending_drafts(conn)
+        sent_log = outbound_email.get_sent_log(conn)
     if pending_drafts:
         for draft in pending_drafts:
             st.markdown(stamp_html("Pending Approval"), unsafe_allow_html=True)
@@ -1159,7 +1219,8 @@ with col2:
             approve_email_col, reject_email_col = st.columns(2)
             with approve_email_col:
                 if st.button("✅ Approve & Send", type="primary", use_container_width=True, key=f"approve_email_{draft['id']}"):
-                    send_result = outbound_email.approve_and_send(auth_get_connection, draft["id"])
+                    with closing(auth_get_connection()) as conn:
+                        send_result = outbound_email.approve_and_send(conn, draft["id"])
                     if send_result.get("status") == "Sent":
                         st.toast(send_result.get("message", "Email sent."), icon="📧")
                     else:
@@ -1167,7 +1228,8 @@ with col2:
                     st.rerun()
             with reject_email_col:
                 if st.button("❌ Reject", use_container_width=True, key=f"reject_email_{draft['id']}"):
-                    outbound_email.reject_draft(auth_get_connection, draft["id"])
+                    with closing(auth_get_connection()) as conn:
+                        outbound_email.reject_draft(conn, draft["id"])
                     st.toast("Draft discarded — not sent.", icon="🚫")
                     st.rerun()
             st.divider()
@@ -1175,12 +1237,37 @@ with col2:
         st.caption("No outbound emails currently pending approval.")
 
     st.divider()
+    st.header("Sent Emails")
+    st.caption("Permanent audit log of every outbound email actually sent -- nothing here was sent without an explicit Approve & Send click.")
+    if sent_log:
+        sent_df = pd.DataFrame(sent_log)[["to_email", "subject", "sent_at"]]
+        sent_df.columns = ["Recipient", "Subject", "Sent At"]
+        st.dataframe(sent_df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No emails sent yet.")
+
+with tab_hold:
     st.markdown("**⏳ Awaiting Customer Reply**")
     st.caption(
         "Orders on hold pending an answer to a clarifying question -- nothing here is ever "
         "auto-processed, regardless of how long it waits."
     )
-    awaiting_holds = hold_requests.get_awaiting_reply(auth_get_connection)
+    # One connection for every read-only query that renders this tab
+    # (all three sections below, including the per-candidate lookup
+    # inside the Needs Manual Linking loop) -- previously each of these
+    # opened its own connection, and the per-candidate lookup alone could
+    # multiply that by however many ambiguous emails were queued.
+    with closing(auth_get_connection()) as read_conn:
+        awaiting_holds = hold_requests.get_awaiting_reply(read_conn)
+        past_follow_up = hold_requests.get_past_follow_up(read_conn)
+        manual_linking_items = hold_requests.get_manual_linking_emails(read_conn)
+        manual_linking_candidates = {
+            ml_item["uid"]: hold_requests.get_open_holds_for_sender(
+                read_conn, parseaddr(ml_item["sender"])[1] or ml_item["sender"]
+            )
+            for ml_item in manual_linking_items
+        }
+
     if awaiting_holds:
         for hold in awaiting_holds:
             st.markdown(stamp_html("Awaiting Reply"), unsafe_allow_html=True)
@@ -1212,7 +1299,6 @@ with col2:
         "Holds where the follow-up window has passed with no reply -- a human needs to "
         "decide what happens next. (Empty until the scheduled follow-up job exists.)"
     )
-    past_follow_up = hold_requests.get_past_follow_up(auth_get_connection)
     if past_follow_up:
         for hold in past_follow_up:
             st.markdown(stamp_html("Past Follow-Up"), unsafe_allow_html=True)
@@ -1244,7 +1330,8 @@ with col2:
                     unsafe_allow_html=True,
                 )
             if st.button("Mark Resolved", key=f"resolve_hold_{hold['id']}", use_container_width=True):
-                hold_requests.resolve_hold(auth_get_connection, hold["id"])
+                with closing(auth_get_connection()) as conn:
+                    hold_requests.resolve_hold(conn, hold["id"])
                 st.toast("Hold marked resolved.", icon="✅")
                 st.rerun()
             st.divider()
@@ -1256,11 +1343,10 @@ with col2:
         "This sender has more than one order on hold, so which one this reply belongs to "
         "can't be determined automatically -- pick the right one, or treat it as a new request."
     )
-    manual_linking_items = hold_requests.get_manual_linking_emails(auth_get_connection)
     if manual_linking_items:
         for ml_item in manual_linking_items:
             ml_sender_address = parseaddr(ml_item["sender"])[1] or ml_item["sender"]
-            candidates = hold_requests.get_open_holds_for_sender(auth_get_connection, ml_sender_address)
+            candidates = manual_linking_candidates[ml_item["uid"]]
 
             st.markdown(stamp_html("Needs Manual Linking"), unsafe_allow_html=True)
             st.markdown(
@@ -1286,8 +1372,9 @@ with col2:
                             "Link", key=f"link_hold_{ml_item['uid']}_{candidate['id']}", use_container_width=True
                         ):
                             agent_input = _build_combined_context(candidate, ml_item["body"])
-                            _run_agent_and_dispatch(agent_input, ml_item, ml_sender_address, matched_hold=candidate)
-                            hold_requests.remove_from_manual_linking(auth_get_connection, ml_item["uid"])
+                            with closing(auth_get_connection()) as conn:
+                                _run_agent_and_dispatch(conn, agent_input, ml_item, ml_sender_address, matched_hold=candidate)
+                                hold_requests.remove_from_manual_linking(conn, ml_item["uid"])
                             st.rerun()
             else:
                 # The candidate holds that made this ambiguous may have
@@ -1300,8 +1387,9 @@ with col2:
                 key=f"treat_as_new_{ml_item['uid']}",
                 use_container_width=True,
             ):
-                _run_agent_and_dispatch(ml_item["body"], ml_item, ml_sender_address, matched_hold=None)
-                hold_requests.remove_from_manual_linking(auth_get_connection, ml_item["uid"])
+                with closing(auth_get_connection()) as conn:
+                    _run_agent_and_dispatch(conn, ml_item["body"], ml_item, ml_sender_address, matched_hold=None)
+                    hold_requests.remove_from_manual_linking(conn, ml_item["uid"])
                 st.rerun()
             st.divider()
     else:
@@ -1329,22 +1417,14 @@ with st.sidebar:
         st.dataframe(ords, use_container_width=True, hide_index=True)
     st.caption(f"Backend: {DB_MODE}. Refreshes automatically after each successful reconciliation.")
 
+with tab_history:
     st.header("Processed Emails")
     st.caption("Reference log of every inbox email run through the agent -- viewable anytime, not just right after processing.")
-    processed_emails = email_ingestion.get_processed_emails(auth_get_connection)
+    with closing(auth_get_connection()) as conn:
+        processed_emails = email_ingestion.get_processed_emails(conn)
     if processed_emails:
         processed_df = pd.DataFrame(processed_emails)[["sender", "subject", "final_status", "processed_at"]]
         processed_df.columns = ["Sender", "Subject", "Status", "Processed At"]
         st.dataframe(processed_df, use_container_width=True, hide_index=True)
     else:
         st.caption("No emails processed yet.")
-
-    st.header("Sent Emails")
-    st.caption("Permanent audit log of every outbound email actually sent -- nothing here was sent without an explicit Approve & Send click.")
-    sent_log = outbound_email.get_sent_log(auth_get_connection)
-    if sent_log:
-        sent_df = pd.DataFrame(sent_log)[["to_email", "subject", "sent_at"]]
-        sent_df.columns = ["Recipient", "Subject", "Sent At"]
-        st.dataframe(sent_df, use_container_width=True, hide_index=True)
-    else:
-        st.caption("No emails sent yet.")

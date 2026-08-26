@@ -114,10 +114,10 @@ CREATE TABLE users (
 """
 
 
-def init_auth_schema(get_connection, is_azure: bool):
+def init_auth_schema(conn, is_azure: bool):
     """Creates the users/login_codes/sessions tables if they don't exist.
-    Call this once alongside the existing ERP schema setup."""
-    conn = get_connection()
+    Call this once alongside the existing ERP schema setup. Takes an
+    already-open connection -- caller owns its lifecycle."""
     cursor = conn.cursor()
     schema = AZURE_SQL_SCHEMA if is_azure else SQLITE_SCHEMA
     if is_azure:
@@ -129,7 +129,6 @@ def init_auth_schema(get_connection, is_azure: bool):
     else:
         cursor.executescript(schema)
     conn.commit()
-    conn.close()
 
 
 # ---------------------------------------------------------------------
@@ -149,15 +148,14 @@ def verify_password(plaintext_password: str, stored_hash: str) -> bool:
 # Sign up
 # ---------------------------------------------------------------------
 
-def sign_up(get_connection, email: str, name: str, password: str) -> dict:
+def sign_up(conn, email: str, name: str, password: str) -> dict:
     """Creates a new user. Returns {'status': 'Success'} or
-    {'status': 'Error', 'message': ...} (e.g. email already registered)."""
-    conn = get_connection()
+    {'status': 'Error', 'message': ...} (e.g. email already registered).
+    Takes an already-open connection -- caller owns its lifecycle."""
     cursor = conn.cursor()
 
     cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
     if cursor.fetchone():
-        conn.close()
         return {"status": "Error", "message": "An account with this email already exists."}
 
     password_hash = hash_password(password)
@@ -168,7 +166,6 @@ def sign_up(get_connection, email: str, name: str, password: str) -> dict:
         (email, name, password_hash, now),
     )
     conn.commit()
-    conn.close()
     return {"status": "Success", "message": "Account created. You can now log in."}
 
 
@@ -204,22 +201,20 @@ def _send_code_email(to_email: str, code: str):
         server.sendmail(gmail_address, [to_email], msg.as_string())
 
 
-def request_login_code(get_connection, email: str, password: str) -> dict:
+def request_login_code(conn, email: str, password: str) -> dict:
     """Step 1 of login: verify password, then email a fresh code.
-    Returns {'status': 'Success', 'user_id': ...} or an Error status."""
-    conn = get_connection()
+    Returns {'status': 'Success', 'user_id': ...} or an Error status.
+    Takes an already-open connection -- caller owns its lifecycle."""
     cursor = conn.cursor()
 
     cursor.execute("SELECT id, password_hash FROM users WHERE email = ?", (email,))
     row = cursor.fetchone()
 
     if not row:
-        conn.close()
         return {"status": "Error", "message": "No account found with this email."}
 
     user_id, stored_hash = row
     if not verify_password(password, stored_hash):
-        conn.close()
         return {"status": "Error", "message": "Incorrect password."}
 
     code = _generate_code()
@@ -230,7 +225,6 @@ def request_login_code(get_connection, email: str, password: str) -> dict:
         (user_id, code, expires_at),
     )
     conn.commit()
-    conn.close()
 
     try:
         _send_code_email(email, code)
@@ -244,14 +238,14 @@ def request_login_code(get_connection, email: str, password: str) -> dict:
 # Login step 2: verify the code, create a session
 # ---------------------------------------------------------------------
 
-def verify_login_code(get_connection, user_id: int, submitted_code: str, is_azure: bool) -> dict:
+def verify_login_code(conn, user_id: int, submitted_code: str, is_azure: bool) -> dict:
     """Step 2 of login: check the code, and if valid, create a session.
     Returns {'status': 'Success', 'session_token': ...} or an Error.
+    Takes an already-open connection -- caller owns its lifecycle.
 
     is_azure picks the right "most recent row" syntax -- LIMIT 1 is
     SQLite-only; Azure SQL (T-SQL) has no LIMIT clause at all and needs
     TOP 1 placed right after SELECT instead of at the end of the query."""
-    conn = get_connection()
     cursor = conn.cursor()
 
     if is_azure:
@@ -269,21 +263,17 @@ def verify_login_code(get_connection, user_id: int, submitted_code: str, is_azur
     row = cursor.fetchone()
 
     if not row:
-        conn.close()
         return {"status": "Error", "message": "No code was requested. Please log in again."}
 
     code_id, stored_code, expires_at, used = row
 
     if used:
-        conn.close()
         return {"status": "Error", "message": "This code has already been used. Please request a new one."}
 
     if _parse_datetime(expires_at) < datetime.now(timezone.utc):
-        conn.close()
         return {"status": "Error", "message": "This code has expired. Please request a new one."}
 
     if submitted_code.strip() != stored_code:
-        conn.close()
         return {"status": "Error", "message": "Incorrect code."}
 
     # Mark the code used so it can never be replayed.
@@ -296,7 +286,6 @@ def verify_login_code(get_connection, user_id: int, submitted_code: str, is_azur
         (session_token, user_id, now),
     )
     conn.commit()
-    conn.close()
 
     return {"status": "Success", "session_token": session_token}
 
@@ -305,15 +294,15 @@ def verify_login_code(get_connection, user_id: int, submitted_code: str, is_azur
 # Session validation (called on every page load)
 # ---------------------------------------------------------------------
 
-def validate_session(get_connection, session_token: str) -> dict:
+def validate_session(conn, session_token: str) -> dict:
     """Checks whether a session token is still valid (exists, and was
     active within the last SESSION_INACTIVITY_MINUTES). If valid,
     refreshes last_active_at (sliding expiry) and returns the user info.
-    If invalid/expired, returns {'status': 'Invalid'}."""
+    If invalid/expired, returns {'status': 'Invalid'}. Takes an
+    already-open connection -- caller owns its lifecycle."""
     if not session_token:
         return {"status": "Invalid"}
 
-    conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute(
@@ -325,7 +314,6 @@ def validate_session(get_connection, session_token: str) -> dict:
     row = cursor.fetchone()
 
     if not row:
-        conn.close()
         return {"status": "Invalid"}
 
     user_id, last_active_at, email, name = row
@@ -335,7 +323,6 @@ def validate_session(get_connection, session_token: str) -> dict:
         # Expired from inactivity -- clean it up.
         cursor.execute("DELETE FROM sessions WHERE session_token = ?", (session_token,))
         conn.commit()
-        conn.close()
         return {"status": "Invalid", "message": "Session expired due to inactivity."}
 
     # Still valid -- refresh the sliding window.
@@ -345,15 +332,14 @@ def validate_session(get_connection, session_token: str) -> dict:
         (now, session_token),
     )
     conn.commit()
-    conn.close()
 
     return {"status": "Valid", "user_id": user_id, "email": email, "name": name}
 
 
-def log_out(get_connection, session_token: str):
-    """Immediately invalidates a session, regardless of the inactivity window."""
-    conn = get_connection()
+def log_out(conn, session_token: str):
+    """Immediately invalidates a session, regardless of the inactivity
+    window. Takes an already-open connection -- caller owns its
+    lifecycle."""
     cursor = conn.cursor()
     cursor.execute("DELETE FROM sessions WHERE session_token = ?", (session_token,))
     conn.commit()
-    conn.close()

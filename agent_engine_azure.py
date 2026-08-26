@@ -82,8 +82,9 @@ def _order_cache():
     return _FALLBACK_ORDER_CACHE
 
 
-def get_order_details(order_id):
-    """Read-only lookup. Never writes to the database.
+def get_order_details(conn, order_id):
+    """Read-only lookup. Never writes to the database. Takes an
+    already-open connection -- caller owns its lifecycle.
 
     Cached per session (see _order_cache) since the same order is often
     looked up more than once while working through an email. The cache is
@@ -93,14 +94,12 @@ def get_order_details(order_id):
     if order_id in cache:
         return cache[order_id]
 
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT customer_name, sku, quantity, delivery_status FROM orders WHERE order_id = ?",
         (order_id,),
     )
     order = cursor.fetchone()
-    conn.close()
 
     if not order:
         result = {"status": "Not Found", "message": f"Order {order_id} not found in system."}
@@ -119,9 +118,9 @@ def get_order_details(order_id):
     return result
 
 
-def check_order_modification(order_id, mapped_sku, requested_quantity):
-    """Read-only feasibility check -- does NOT write to the database."""
-    conn = get_connection()
+def check_order_modification(conn, order_id, mapped_sku, requested_quantity):
+    """Read-only feasibility check -- does NOT write to the database.
+    Takes an already-open connection -- caller owns its lifecycle."""
     cursor = conn.cursor()
 
     cursor.execute(
@@ -131,12 +130,10 @@ def check_order_modification(order_id, mapped_sku, requested_quantity):
     order = cursor.fetchone()
 
     if not order:
-        conn.close()
         return {"status": "Error", "message": f"Order {order_id} not found in system."}
 
     current_qty, status = order
     if status in ("Dispatched", "Delivered"):
-        conn.close()
         return {
             "status": "Rejected",
             "message": f"Cannot modify order. Status is already '{status}'.",
@@ -145,7 +142,6 @@ def check_order_modification(order_id, mapped_sku, requested_quantity):
     cursor.execute("SELECT available_stock FROM inventory WHERE sku = ?", (mapped_sku,))
     stock_record = cursor.fetchone()
     available_stock = stock_record[0] if stock_record else 0
-    conn.close()
 
     quantity_difference = requested_quantity - current_qty
 
@@ -167,11 +163,11 @@ def check_order_modification(order_id, mapped_sku, requested_quantity):
     }
 
 
-def commit_order_modification(order_id, mapped_sku, requested_quantity):
+def commit_order_modification(conn, order_id, mapped_sku, requested_quantity):
     """Actually writes the change to the database. Re-validates from
     scratch to guard against the order's state having changed between
-    check and approval."""
-    conn = get_connection()
+    check and approval. Takes an already-open connection -- caller owns
+    its lifecycle."""
     cursor = conn.cursor()
 
     cursor.execute(
@@ -181,12 +177,10 @@ def commit_order_modification(order_id, mapped_sku, requested_quantity):
     order = cursor.fetchone()
 
     if not order:
-        conn.close()
         return {"status": "Error", "message": f"Order {order_id} not found in system."}
 
     current_qty, status = order
     if status in ("Dispatched", "Delivered"):
-        conn.close()
         return {
             "status": "Rejected",
             "message": f"Cannot modify order. Status is already '{status}'.",
@@ -199,7 +193,6 @@ def commit_order_modification(order_id, mapped_sku, requested_quantity):
     quantity_difference = requested_quantity - current_qty
 
     if quantity_difference > available_stock:
-        conn.close()
         return {
             "status": "Insufficient Stock",
             "message": (
@@ -225,8 +218,6 @@ def commit_order_modification(order_id, mapped_sku, requested_quantity):
     except Exception as e:
         conn.rollback()
         return {"status": "Error", "message": str(e)}
-    finally:
-        conn.close()
 
 
 def package_clarification(ambiguous_reference, candidate_skus, clarifying_question):
@@ -239,15 +230,17 @@ def package_clarification(ambiguous_reference, candidate_skus, clarifying_questi
     }
 
 
-def _execute_tool(tool_name, tool_inputs):
+def _execute_tool(conn, tool_name, tool_inputs):
     """Dispatches a single tool call to its local implementation.
     Returns the result dict, and a flag for whether this tool should
-    short-circuit the loop (used only by request_clarification)."""
+    short-circuit the loop (used only by request_clarification). Takes
+    an already-open connection -- caller owns its lifecycle."""
     if tool_name == "get_order_details":
-        return get_order_details(order_id=tool_inputs["order_id"]), False
+        return get_order_details(conn, order_id=tool_inputs["order_id"]), False
 
     if tool_name == "verify_order_modification":
         result = check_order_modification(
+            conn,
             order_id=tool_inputs["order_id"],
             mapped_sku=tool_inputs["mapped_sku"],
             requested_quantity=tool_inputs["requested_quantity"],
@@ -265,8 +258,10 @@ def _execute_tool(tool_name, tool_inputs):
     return {"status": "Error", "message": f"Unknown tool: {tool_name}"}, False
 
 
-def run_agent(email_text):
-    """Orchestrates a multi-step tool-use loop against Azure SQL Database."""
+def run_agent(conn, email_text):
+    """Orchestrates a multi-step tool-use loop against Azure SQL Database.
+    Takes an already-open connection, threaded through to every tool
+    call made during the loop -- caller owns its lifecycle."""
 
     messages = [{"role": "user", "content": email_text}]
     tool_call_log = []
@@ -291,7 +286,7 @@ def run_agent(email_text):
         tool_name = tool_use.name
         tool_inputs = tool_use.input
 
-        result, should_stop = _execute_tool(tool_name, tool_inputs)
+        result, should_stop = _execute_tool(conn, tool_name, tool_inputs)
         tool_call_log.append({"tool_called": tool_name, "inputs": tool_inputs, "result": result})
 
         if should_stop:

@@ -96,10 +96,10 @@ def _ensure_column(cursor, is_azure: bool, table: str, column: str, sqlite_type:
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sqlite_type}")
 
 
-def init_outbound_email_schema(get_connection, is_azure: bool):
+def init_outbound_email_schema(conn, is_azure: bool):
     """Creates the outbound_emails table if it doesn't already exist.
-    Call this alongside the other schema init functions at startup."""
-    conn = get_connection()
+    Call this alongside the other schema init functions at startup.
+    Takes an already-open connection -- caller owns its lifecycle."""
     cursor = conn.cursor()
     if is_azure:
         for statement in AZURE_SQL_SCHEMA.split(";"):
@@ -109,11 +109,10 @@ def init_outbound_email_schema(get_connection, is_azure: bool):
         cursor.executescript(SQLITE_SCHEMA)
     _ensure_column(cursor, is_azure, "outbound_emails", "message_id", "TEXT", "NVARCHAR(998)")
     conn.commit()
-    conn.close()
 
 
 def queue_draft(
-    get_connection,
+    conn,
     to_email: str,
     subject: str,
     body: str,
@@ -121,7 +120,8 @@ def queue_draft(
     message_id: str | None = None,
 ) -> dict:
     """Adds a drafted email to the approval queue. Does NOT send
-    anything -- this only ever creates a 'Pending Approval' row.
+    anything -- this only ever creates a 'Pending Approval' row. Takes
+    an already-open connection -- caller owns its lifecycle.
 
     message_id, when given, is the Message-ID header hold_requests.
     create_hold() already stored as sent_message_id for this same Hold --
@@ -129,7 +129,6 @@ def queue_draft(
     whenever a human eventually approves it) so a customer's mail client
     reply carries a matching In-Reply-To header (Layer 1 of
     hold_requests.match_reply_to_hold())."""
-    conn = get_connection()
     cursor = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
 
@@ -148,21 +147,18 @@ def queue_draft(
         (to_email, now),
     )
     row = cursor.fetchone()
-    conn.close()
 
     return {"status": "Queued", "draft_id": row[0] if row else None}
 
 
-def get_pending_drafts(get_connection) -> list[dict]:
+def get_pending_drafts(conn) -> list[dict]:
     """Returns all emails currently awaiting approval, oldest first."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, to_email, subject, body, context_note, message_id, created_at "
         "FROM outbound_emails WHERE status = 'Pending Approval' ORDER BY created_at ASC"
     )
     rows = cursor.fetchall()
-    conn.close()
 
     return [
         {
@@ -173,17 +169,15 @@ def get_pending_drafts(get_connection) -> list[dict]:
     ]
 
 
-def get_sent_log(get_connection) -> list[dict]:
+def get_sent_log(conn) -> list[dict]:
     """Returns all previously sent emails, most recent first -- an
     audit log, same spirit as the processed_emails table."""
-    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, to_email, subject, body, sent_at "
         "FROM outbound_emails WHERE status = 'Sent' ORDER BY sent_at DESC"
     )
     rows = cursor.fetchall()
-    conn.close()
 
     return [
         {"id": r[0], "to_email": r[1], "subject": r[2], "body": r[3], "sent_at": r[4]}
@@ -223,12 +217,12 @@ def _send_via_smtp(to_email: str, subject: str, body: str, message_id: str | Non
         server.sendmail(GMAIL_ADDRESS, [to_email], msg.as_string())
 
 
-def approve_and_send(get_connection, draft_id: int) -> dict:
+def approve_and_send(conn, draft_id: int) -> dict:
     """The ONLY function that actually sends an email. Called
     exclusively from an explicit human click in the UI -- never from
     inside the agent's own reasoning loop, same principle as
-    commit_order_modification never being callable by Claude directly."""
-    conn = get_connection()
+    commit_order_modification never being callable by Claude directly.
+    Takes an already-open connection -- caller owns its lifecycle."""
     cursor = conn.cursor()
 
     cursor.execute(
@@ -238,18 +232,15 @@ def approve_and_send(get_connection, draft_id: int) -> dict:
     row = cursor.fetchone()
 
     if not row:
-        conn.close()
         return {"status": "Error", "message": "Draft not found."}
 
     to_email, subject, body, status, message_id = row
     if status != "Pending Approval":
-        conn.close()
         return {"status": "Error", "message": f"This draft is already '{status}', not pending."}
 
     try:
         _send_via_smtp(to_email, subject, body, message_id=message_id)
     except Exception as e:
-        conn.close()
         return {"status": "Error", "message": f"Failed to send: {e}"}
 
     now = datetime.now(timezone.utc).isoformat()
@@ -258,19 +249,17 @@ def approve_and_send(get_connection, draft_id: int) -> dict:
         (now, draft_id),
     )
     conn.commit()
-    conn.close()
 
     return {"status": "Sent", "message": f"Email sent to {to_email}."}
 
 
-def reject_draft(get_connection, draft_id: int) -> dict:
-    """Discards a drafted email without sending it."""
-    conn = get_connection()
+def reject_draft(conn, draft_id: int) -> dict:
+    """Discards a drafted email without sending it. Takes an
+    already-open connection -- caller owns its lifecycle."""
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE outbound_emails SET status = 'Rejected' WHERE id = ?",
         (draft_id,),
     )
     conn.commit()
-    conn.close()
     return {"status": "Rejected"}

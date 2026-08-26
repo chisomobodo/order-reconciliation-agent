@@ -56,6 +56,35 @@ are invented.
       run (individually, or all at once) through the identical
       `run_agent()` pipeline as a manually pasted email — same tool-call
       display, same approval-gate flow; see "Email Ingestion" below
+- [x] Approval-gated outbound email (`outbound_email.py`) — every reply
+      the agent drafts is queued as a "Pending Approval" row, never sent
+      automatically; a human explicitly clicks **Approve & Send** before
+      anything reaches a real inbox, mirroring the same check/commit
+      split used for database writes; see "Approval-Gated Outbound
+      Email" below
+- [x] Hold state + four-layer reply matching (`hold_requests.py`) — a
+      clarification-needing order is placed "on hold" (full inbound
+      email + question preserved) instead of silently dropped while
+      waiting on a reply; a later customer reply is matched back to the
+      right Hold automatically (Message-ID threading, a `HOLD-{id}` tag,
+      or a unique sender match), and a genuinely ambiguous case is
+      queued for a human to link manually rather than guessed at; see
+      "Hold State & Reply Matching" below
+- [x] Scheduled follow-up job (`check_holds.py`) — a standalone,
+      independently-run script (intended as an Azure Container Apps Job,
+      not a background thread) that drafts an honest "still on hold"
+      follow-up for any Hold that's gone unanswered past
+      `FOLLOW_UP_WINDOW_MINUTES`; still fully gated behind human
+      approval, never auto-sent
+- [x] Dashboard reorganized into tabs — Process Email, Inbox, Outbound
+      Queue, On Hold, History — grouping what had grown into one long
+      scrolling page by task; the sidebar (live ERP state) and header
+      stay visible regardless of which tab is active
+- [x] One database connection per user action, not per function call —
+      every DB-touching function across the project now takes an
+      already-open `conn` instead of opening and closing its own; a
+      single "Process" click used to open 5+ separate Azure SQL
+      connections in sequence, now opens exactly one
 
 ## How it works
 
@@ -88,6 +117,9 @@ theme.py                       Design system (shipping-manifest aesthetic, stamp
 auth.py                         Login/sign-up backend (bcrypt + emailed code + sessions)
 auth_theme.py                    Login/sign-up screen design, restyled in the app's palette
 email_ingestion.py                Real IMAP ingestion of customer emails from a Gmail label
+outbound_email.py                  Approval-gated outbound email queue (draft -> human approves -> sent)
+hold_requests.py                    Hold-state tracking + four-layer reply-to-clarification matching
+check_holds.py                       Standalone scheduled job: drafts follow-ups for overdue Holds
 setup_db.py                     Mock ERP schema + seed data (SQLite)
 setup_db_azure.py                Mock ERP schema + seed data (Azure SQL)
 generate_test_emails.py           Generates sample_emails.json via Claude
@@ -221,8 +253,8 @@ two steps, not one:
    at the end. If `run_agent()` itself raises, the email is left in
    `pending_emails` and never marked read, so it's retried on the next
    check instead of silently lost. A **Processed Emails** log in the
-   sidebar shows the full `processed_emails` history (sender, subject,
-   status, timestamp) as a standing reference, viewable anytime.
+   **History** tab shows the full `processed_emails` history (sender,
+   subject, status, timestamp) as a standing reference, viewable anytime.
 
 Reuses `GMAIL_ADDRESS` / `GMAIL_APP_PASSWORD` from "Login &
 Authentication" above (Gmail App Passwords work for both sending, via
@@ -238,13 +270,14 @@ One-time setup in Gmail itself (not code): create a label (e.g.
 should be treated as customer order-change requests.
 
 Every reply the agent drafts (clarification questions, order-change
-confirmations — see "Approval-gated outbound email" below) sets its
+confirmations — see "Approval-Gated Outbound Email" below) sets its
 `Reply-To` to this same intake address, not a no-reply one, since a
 customer's reply needs to land back in `OrderRequests` for the next
-"Check Inbox" to pick it up — this is what the Hold-state feature is
-waiting on. Defaults to `<GMAIL_ADDRESS local-part>+orders@<domain>`
-(Gmail's own plus-addressing, matching the filter rule that routes mail
-into the `OrderRequests` label); override it explicitly if needed:
+"Check Inbox" to pick it up — this is what the Hold-state feature (see
+"Hold State & Reply Matching" below) is waiting on. Defaults to
+`<GMAIL_ADDRESS local-part>+orders@<domain>` (Gmail's own
+plus-addressing, matching the filter rule that routes mail into the
+`OrderRequests` label); override it explicitly if needed:
 
 ```bash
 export ORDER_INTAKE_EMAIL=youraddress+orders@gmail.com  # optional -- derived from GMAIL_ADDRESS if unset
@@ -252,6 +285,76 @@ export ORDER_INTAKE_EMAIL=youraddress+orders@gmail.com  # optional -- derived fr
 
 (Login-code emails from `auth.py` are unaffected — those keep a genuine
 no-reply address, since a reply is never expected there.)
+
+### Approval-Gated Outbound Email
+
+Every reply `run_agent()` drafts — a clarification question, an
+order-change confirmation, anything — goes into an approval queue
+(`outbound_email.py`) as a **Pending Approval** row first. Nothing is
+ever sent automatically: a human reviews the draft in the **Outbound
+Queue** tab and explicitly clicks **✅ Approve & Send** before anything
+reaches a real inbox, or **❌ Reject** to discard it. This is the exact
+same check/commit split already used for database writes
+(`verify_order_modification` vs `commit_order_modification`), extended
+to outbound email — `queue_draft()` only ever creates a row;
+`approve_and_send()` is the only function that actually calls SMTP, and
+it's never reachable from Claude's own tool loop.
+
+Sent emails are logged permanently in the **Sent Emails** audit trail
+(same tab, below the pending queue) — nothing appears there without a
+matching explicit approval click.
+
+### Hold State & Reply Matching
+
+When `request_clarification` fires *and* the customer gave an order ID,
+the order is placed **on hold** (`hold_requests.py`) rather than
+silently lost while waiting for an answer: the full original inbound
+email and the exact clarifying question sent are both stored (not a
+summary — a human reviewing this later needs real context). Holds
+appear in the **On Hold** tab under "⏳ Awaiting Customer Reply".
+
+When a later email comes in, it's checked against every open Hold
+before being treated as a new request, most-reliable signal first:
+
+1. **Message-ID threading.** The clarifying question's outgoing
+   `Message-ID` header (generated via `email.utils.make_msgid()` at
+   Hold-creation time, before the email is even sent) is stored on the
+   Hold. If the reply's `In-Reply-To` or `References` header matches
+   it, that's a match — this can't be a coincidental false positive,
+   since the ID was generated locally.
+2. **`HOLD-{id}` tag.** Every clarifying question's subject and body
+   include a `[HOLD-{id}]` reference and ask the customer to keep it in
+   their reply. Survives a mail client that strips threading headers.
+3. **Sender-email fallback.** If neither of the above matches, and
+   *exactly one* open Hold belongs to that sender, that's the match.
+4. **Manual linking.** If more than one open Hold belongs to that
+   sender, the system never guesses — the email is queued in the **🔗
+   Needs Manual Linking** section (On Hold tab) with the candidate
+   Holds listed, for a human to pick the right one (or mark it as a
+   genuinely new, unrelated request).
+
+A matched reply is combined with the original request and the
+clarifying question into full context, run back through `run_agent()`,
+and the Hold is marked resolved. If that reply is itself still
+ambiguous, the agent's new question is sent back to the customer as an
+ordinary reply — the original Hold is not left open or replaced with a
+second one in this version.
+
+The scheduled follow-up job (`check_holds.py`) is a standalone script —
+run manually (`python3 check_holds.py`) or on a schedule as an **Azure
+Container Apps Job**, deliberately *not* a background thread inside the
+web app, since Container Apps scales the web app to zero on idle, which
+would silently kill any in-process thread too. Past
+`FOLLOW_UP_WINDOW_MINUTES` (default 30) with no reply, it drafts an
+honest follow-up — "this remains on hold until we hear from you," never
+"we've gone ahead and processed it" — queues it the normal
+approval-gated way, and flags the Hold "Past Follow-Up" in the **🚨
+Needs Attention** section. Nothing here is ever auto-processed,
+regardless of how long it waits.
+
+```bash
+export FOLLOW_UP_WINDOW_MINUTES=30  # optional -- this is the default
+```
 
 ## Docker & Deployment
 
@@ -382,6 +485,36 @@ Approve yet. An email is deliberately left unread (not marked processed)
 if `run_agent()` itself raises, so a transient failure (e.g. a dropped
 Claude API call) gets retried on the next check instead of silently
 losing that email.
+
+**One connection per action, not per function (`app.py` and every
+module it calls into).** Every DB-touching function across the project
+originally opened and closed its own connection — clean in isolation,
+but a single user action routinely chains through five or more of them
+(e.g. "Process" touching `get_order_details`, `verify_order_
+modification`, `create_hold`, `queue_draft`, `record_processed_email`),
+each paying its own connection-handshake cost. Over Azure SQL that cost
+is real and stacks up visibly. Every such function now takes an
+already-open `conn` instead of a connection-opening callable, and
+`app.py` opens exactly one connection per action (`with
+closing(auth_get_connection()) as conn:`, guaranteeing it closes even
+if something raises partway through) and threads it through the whole
+chain, including into `run_agent()`'s internal Claude tool-use loop.
+The two calling conventions are deliberately not both supported —
+passing the old connection-opening callable where a function now
+expects an open connection fails immediately and loudly (`AttributeError:
+'function' object has no attribute 'cursor'`) rather than silently
+working, so a missed call site can't hide as a quiet bug.
+
+**Tabs, not one long scrolling page (`app.py`).** As Inbox, Outbound
+Queue, Hold state, and History each grew their own section, the
+dashboard became one long stacked column. Reorganizing into
+`st.tabs()` — Process Email, Inbox, Outbound Queue, On Hold, History —
+is a pure layout change: identical widgets, keys, session state, and
+function calls, just grouped by task instead of by however each
+feature happened to be bolted on. The sidebar (live ERP state) and
+header stay outside the tabs, visible regardless of which one is
+active, since they're context a user wants no matter what they're
+doing.
 
 ## Limitations & Production Considerations
 
