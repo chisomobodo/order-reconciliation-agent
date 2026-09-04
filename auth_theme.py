@@ -304,10 +304,30 @@ div[data-testid="stTextInput"] input {{
 
 @media (max-width: 820px) {{
     div[data-testid="stHorizontalBlock"]:has(.auth-hero) {{ flex-direction: column; }}
-    .auth-hero {{ padding: 32px 28px; }}
-    div[data-testid="stHorizontalBlock"]:has(.auth-hero) > div[data-testid="stColumn"]:nth-of-type(2) {{
-        padding: 32px 28px;
+    /* The desktop side-by-side layout gives both columns a matching
+       min-height: 640px so the hero panel and form panel read as one
+       even-height card. Stacked on mobile, that same forced min-height
+       on the HERO column alone (whose real content is much shorter than
+       640px) left a large dead gap of empty gradient background before
+       the form even started -- the form was actually rendering the
+       whole time, just pushed hundreds of pixels down off-screen.
+       Confirmed via direct DOM measurement: hero column height was
+       640px, but the hero's own content only filled roughly half of
+       that. Auto-height here lets each stacked column size to its own
+       content instead. */
+    div[data-testid="stHorizontalBlock"]:has(.auth-hero) > div[data-testid="stColumn"] {{
+        min-height: auto;
     }}
+    .auth-hero {{ padding: 28px 24px; height: auto; }}
+    .auth-hero-title {{ font-size: 1.9rem; }}
+    div[data-testid="stHorizontalBlock"]:has(.auth-hero) > div[data-testid="stColumn"]:nth-of-type(2) {{
+        padding: 28px 24px;
+    }}
+}}
+
+@media (max-width: 480px) {{
+    .auth-hero-title {{ font-size: 1.65rem; }}
+    .auth-form-title {{ font-size: 1.35rem; }}
 }}
 </style>
 """

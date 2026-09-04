@@ -107,36 +107,6 @@ h1, h2, h3 {{
     color: var(--text) !important;
 }}
 
-.manifest-title {{
-    font-family: 'Oswald', sans-serif;
-    font-weight: 700;
-    font-size: 2.1rem;
-    letter-spacing: 0.03em;
-    text-transform: uppercase;
-    color: var(--text);
-    display: flex;
-    align-items: baseline;
-    gap: 0.6rem;
-    margin-bottom: 0;
-    animation: fadeSlideDown 0.5s ease-out;
-}}
-.manifest-title .accent-bar {{
-    display: inline-block;
-    width: 10px;
-    height: 32px;
-    background: var(--accent);
-    border-radius: 2px;
-    margin-right: 4px;
-}}
-.manifest-sub {{
-    font-family: 'IBM Plex Mono', monospace;
-    color: var(--text-dim);
-    font-size: 0.85rem;
-    letter-spacing: 0.04em;
-    margin-top: 2px;
-    animation: fadeSlideDown 0.6s ease-out;
-}}
-
 /* Main header logo lockup: assets/arbiter_icon_header.svg (the mark
    alone -- transparent background, no <title>/<desc>, so no unwanted
    hover tooltip or background box) next to a real HTML wordmark, not
@@ -161,6 +131,48 @@ h1, h2, h3 {{
     font-size: 1.9rem;
     letter-spacing: 0.02em;
     color: var(--text);
+}}
+
+/* Header row (logo, auto-approve toggle, theme toggle, user/logout) --
+   st.columns' default behavior is to keep every column on one row and
+   shrink-to-fit as the viewport narrows, with no minimum -- there's no
+   "wrap onto a second row" until Streamlit's own much-narrower internal
+   breakpoint stacks everything into a single column. At in-between
+   widths (a tablet, or even a 1024px desktop once the sidebar eats a
+   few hundred px of it) that shrinking squeezed short button/label text
+   down to one character per line ("Lo" / "g" / "out") instead of ever
+   wrapping normally -- confirmed via real screenshots at 768px and
+   1024px. flex-wrap lets a column that no longer fits drop to the next
+   line instead of continuing to shrink past its content's natural
+   width; min-width keeps each column wide enough that ITS OWN content
+   doesn't need to squeeze in the first place. Scoped to the header's
+   own row (and the "Logged in as X" / "Log out" row nested inside it)
+   via :has(.app-header-logo-row) so this never touches the many other
+   st.columns() layouts elsewhere in the app. */
+div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row),
+div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row) div[data-testid="stHorizontalBlock"] {{
+    flex-wrap: wrap !important;
+    row-gap: var(--space-sm);
+}}
+div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row) > div[data-testid="stColumn"] {{
+    min-width: 200px !important;
+}}
+div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row) .stButton button {{
+    white-space: nowrap;
+}}
+/* When a column ends up alone on its own wrapped line (e.g. "Logged in
+   as X" wrapping above the "Log out" button once the viewport is narrow
+   enough that even the nested row's own min-width no longer fits both
+   side by side), Streamlit's own height calculation for that column
+   stayed sized for its ORIGINAL side-by-side flex-basis instead of its
+   actual (padding-top-inclusive) content height -- confirmed via direct
+   measurement: an 11px-tall column box containing a padding-top:8px
+   text line. The text still rendered, just partly past its own box's
+   bottom edge, visually overlapping the button wrapped below it.
+   Forcing auto height here lets each wrapped column size to its real
+   content instead of a stale pre-wrap value. */
+div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row) div[data-testid="stColumn"] {{
+    height: auto !important;
 }}
 
 /* --- Section heading: the ONE style for every top-level named section
@@ -320,8 +332,14 @@ h1, h2, h3 {{
     border-radius: 6px !important;
 }}
 
-/* Primary button -> manifest "process" stamp button */
-.stButton button[kind="primary"] {{
+/* Primary button -> manifest "process" stamp button. A button inside
+   st.form() (e.g. "Send login code", "Verify code", "Create account")
+   renders with kind="primaryFormSubmit" instead of plain "primary" --
+   confirmed via the live DOM -- so every form-submit button was falling
+   through to Streamlit's unstyled default (red) instead of picking up
+   this rule at all. Both kind values are matched here so any primary
+   button reads the same regardless of whether it lives inside a form. */
+.stButton button[kind="primary"], .stButton button[kind="primaryFormSubmit"] {{
     background: var(--accent) !important;
     color: var(--accent-ink) !important;
     border: none !important;
@@ -334,22 +352,32 @@ h1, h2, h3 {{
     transition: transform 0.15s ease, box-shadow 0.15s ease;
     box-shadow: 0 2px 0 rgba(0,0,0,0.25);
 }}
-.stButton button[kind="primary"]:hover {{
+.stButton button[kind="primary"]:hover, .stButton button[kind="primaryFormSubmit"]:hover {{
     transform: translateY(-2px);
     box-shadow: 0 4px 10px rgba(0,0,0,0.25);
 }}
-.stButton button[kind="primary"]:active {{
+.stButton button[kind="primary"]:active, .stButton button[kind="primaryFormSubmit"]:active {{
     transform: translateY(0px);
     box-shadow: 0 1px 0 rgba(0,0,0,0.25);
 }}
 
-/* Theme toggle button (secondary) */
-.stButton button[kind="secondary"] {{
+/* Theme toggle button (secondary) -- same kind-name mismatch as above
+   applies to secondary form-submit buttons (e.g. "Start over"). */
+.stButton button[kind="secondary"], .stButton button[kind="secondaryFormSubmit"] {{
     border: 1px solid var(--border) !important;
     background: var(--surface) !important;
     color: var(--text) !important;
     border-radius: 20px !important;
     font-size: 0.85rem;
+}}
+
+/* Touch target minimum (~44px, the standard comfortable tap-target
+   floor) for every button -- Streamlit's default button height is
+   comfortably above this on desktop, but the compact secondary/toggle
+   buttons could otherwise end up shorter once padding is squeezed by
+   the header's responsive wrapping above. */
+.stButton button {{
+    min-height: 44px;
 }}
 
 /* --- Step cards: the conveyor-belt reveal for tool calls --- */
@@ -444,7 +472,7 @@ h1, h2, h3 {{
 }}
 
 @media (prefers-reduced-motion: reduce) {{
-    .step-card, .stamp, .reply-card, .manifest-title, .manifest-sub, .app-header-logo-row,
+    .step-card, .stamp, .reply-card, .app-header-logo-row,
     .section-heading, .empty-state, [data-testid="stTabPanel"] {{
         animation: none !important;
         opacity: 1 !important;

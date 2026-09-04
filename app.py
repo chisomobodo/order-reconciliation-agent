@@ -40,6 +40,46 @@ from theme import (
 
 st.set_page_config(layout="wide", page_title="Arbiter", page_icon="assets/arbiter_favicon.png")
 
+ARBITER_HEADER_ICON_SVG_PATH = "assets/arbiter_icon_header.svg"
+
+
+def _load_svg(path: str) -> str:
+    """Reads an SVG asset's raw markup for inline embedding via
+    st.markdown(..., unsafe_allow_html=True). Returns an empty string
+    if the file is missing, so a moved/renamed asset degrades to no
+    logo rather than crashing the page."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def _header_logo_html() -> str:
+    """The one branded header lockup (icon + 'Arbiter' wordmark), used
+    for the fully-loaded page AND every loading/waiting/error state
+    that renders before it (DB_INIT_ERROR, the retry-exhausted DB
+    connection handler, the cookie-probe "Checking session..." wait) --
+    those states used to fall back to old plain-text/uppercase markup
+    (.manifest-title) instead of this, causing a visible flash of
+    unbranded content before the real header took over on every single
+    page load. Defined here, near the top of the script, specifically
+    so it's available to those early states -- they run before the
+    header's own code further down. assets/arbiter_icon_header.svg is
+    the mark alone -- no <title>/<desc> (which the browser renders as a
+    hover tooltip on the earlier logo variant) and no background rect
+    (which showed as an unwanted dark box around the icon). The
+    wordmark is a real HTML element here, not baked into the SVG, so it
+    can be styled/positioned independently."""
+    icon_svg = _load_svg(ARBITER_HEADER_ICON_SVG_PATH)
+    icon_html = f'<span class="app-header-icon">{icon_svg}</span>' if icon_svg else ""
+    return f"""
+    <div class="app-header-logo-row">
+        {icon_html}
+        <span class="app-header-wordmark">Arbiter</span>
+    </div>
+    """
+
 # --- Backend selection: local SQLite (fast iteration) vs Azure SQL (cloud
 # demo). USE_AZURE_DB=true switches both the agent's tool backend and the
 # sidebar's live ERP view. Defaults to local SQLite. If Azure is requested
@@ -123,10 +163,7 @@ st.markdown(build_css(st.session_state.theme), unsafe_allow_html=True)
 # connection for auth OR the app, so that error is shown instead of a
 # login form that would just fail on every attempt.
 if DB_INIT_ERROR:
-    st.markdown(
-        '<div class="manifest-title"><span class="accent-bar"></span>Arbiter</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(_header_logo_html(), unsafe_allow_html=True)
     # Clean, simple primary message for the end user -- the actual
     # exception and the env vars to check are real diagnostic info
     # (useful to whoever runs/deploys this), but they're internal
@@ -142,108 +179,14 @@ if DB_INIT_ERROR:
         )
     st.stop()
 
-
-# --- Startup schema init: retry, same pattern as the sidebar's ERP
-# snapshot ---
-# The four _ensure_*_schema() calls just below are the FIRST database
-# connections the app makes -- before the cookie/session check, before
-# the auth screen, before anything else that renders. get_db_snapshot()
-# (sidebar, defined later in this file) already retries on a cold Azure
-# SQL connection; these calls had no such protection, so a single
-# transient timeout here crashed the whole app with a raw traceback
-# before the user ever saw a page. Reusing the exact same retry shape
-# (5 attempts, 1.5s apart) -- the per-attempt Connection Timeout=10 in
-# agent_engine_azure.py's connection string already applies here too,
-# since auth_get_connection IS that same get_connection function in
-# Azure mode, not a separate one that needs its own timeout change.
-STARTUP_DB_MAX_ATTEMPTS = 5
-STARTUP_DB_RETRY_DELAY_S = 1.5
-
-
-def _connect_with_retry():
-    """Drop-in replacement for calling auth_get_connection() directly --
-    used by each _ensure_*_schema() function below to get an open
-    connection with retry behavior, before passing it into the
-    corresponding init_*_schema(conn, is_azure=...) call. Harmless for
-    local SQLite too -- sqlite3.connect() doesn't fail on a cold start,
-    so the loop just succeeds on the first attempt every time."""
-    last_error = None
-    for attempt in range(1, STARTUP_DB_MAX_ATTEMPTS + 1):
-        try:
-            return auth_get_connection()
-        except Exception as e:
-            last_error = e
-            if attempt < STARTUP_DB_MAX_ATTEMPTS:
-                time.sleep(STARTUP_DB_RETRY_DELAY_S)
-    raise last_error
-
-
-@st.cache_resource
-def _ensure_auth_schema():
-    """Runs once for the life of the process (st.cache_resource, not
-    cache_data -- this is setup, not data), alongside the ERP tables in
-    the same database. Opens its own single retry-wrapped connection --
-    init_auth_schema() now takes an already-open conn rather than a
-    connection-opening callable, matching every other DB-touching
-    function in the project after the get_connection -> conn refactor."""
-    with closing(_connect_with_retry()) as conn:
-        auth.init_auth_schema(conn, is_azure=USE_AZURE_DB)
-    return True
-
-
-@st.cache_resource
-def _ensure_email_tracking_schema():
-    """Same pattern as _ensure_auth_schema -- pending_emails/
-    processed_emails live in the same database, created once per process."""
-    with closing(_connect_with_retry()) as conn:
-        email_ingestion.init_email_tracking_schema(conn, is_azure=USE_AZURE_DB)
-    return True
-
-
-@st.cache_resource
-def _ensure_outbound_email_schema():
-    """Same pattern again -- outbound_emails (the send-approval queue)
-    lives in the same database, created once per process."""
-    with closing(_connect_with_retry()) as conn:
-        outbound_email.init_outbound_email_schema(conn, is_azure=USE_AZURE_DB)
-    return True
-
-
-@st.cache_resource
-def _ensure_hold_requests_schema():
-    """Same pattern again -- hold_requests (orders paused on a
-    clarifying question) lives in the same database, created once per
-    process."""
-    with closing(_connect_with_retry()) as conn:
-        hold_requests.init_hold_requests_schema(conn, is_azure=USE_AZURE_DB)
-    return True
-
-
-try:
-    with st.spinner("Connecting..."):
-        _ensure_auth_schema()
-        _ensure_email_tracking_schema()
-        _ensure_outbound_email_schema()
-        _ensure_hold_requests_schema()
-except Exception as e:
-    # Every retry attempt is exhausted at this point -- show a clean
-    # message instead of the raw traceback Streamlit would otherwise
-    # render for an uncaught exception this early in the script.
-    st.markdown(
-        '<div class="manifest-title"><span class="accent-bar"></span>Arbiter</div>',
-        unsafe_allow_html=True,
-    )
-    st.error("Couldn't connect to the database after several attempts. Please try again shortly.")
-    with st.expander("Technical details"):
-        st.markdown(
-            f"Could not connect to {DB_MODE} to set up the database after "
-            f"{STARTUP_DB_MAX_ATTEMPTS} attempts: {e}\n\n"
-            "This is usually a transient cold-start delay -- reloading the page in "
-            "a few moments often resolves it. If it keeps happening, check that "
-            "AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, and "
-            "AZURE_SQL_PASSWORD are all correct."
-        )
-    st.stop()
+# Database schema setup (auth/session, inbox-tracking, outbound-email
+# queue, hold-requests tables) no longer happens here. It used to run on
+# every process's first page load (_ensure_*_schema(), gated behind
+# @st.cache_resource) -- now it runs once at container startup, before
+# Streamlit ever starts accepting traffic. See init_db.py and
+# entrypoint.sh: the container's HTTP port doesn't open until schema
+# init has already completed successfully, so no request from any user
+# can race an uninitialized database.
 
 # --- Session cookie: read side ---
 # CookieManager.get()/get_all() hardcode default={} internally (confirmed
@@ -264,13 +207,31 @@ except Exception as e:
 # unnecessary async race surface during exactly the window we're trying
 # to make reliable. CookieManager is only instantiated later, transiently,
 # at the point .set() is actually needed (login success) -- see below.
-COOKIE_PROBE_MAX_ATTEMPTS = 6
-COOKIE_PROBE_RETRY_DELAY_S = 0.35  # ~2.1s worst case across all retries
+# Budget was originally 6 attempts * 0.35s (~2.1s worst case), sized
+# around a fast local browser's component mount time. Measured directly
+# (real Chrome, Playwright, repeated fresh/uncached page loads against
+# this app): the cookie component's actual mount + document.cookie read +
+# postMessage round-trip took 4.4s-9.7s on a cold/uncached load, and only
+# ~1-1.7s on a warm reload in the same browser -- so almost every FIRST
+# load of a session was blowing through the old ~2.1s budget and falling
+# into the branch below that just waits, silently and indefinitely, for
+# Streamlit's own automatic rerun-on-value-change. That branch still
+# resolves correctly (nothing was ever actually stuck), but it has no
+# visible retry/spinner cadence of its own (each active-loop attempt
+# re-renders a spinner; the fallback is one static, unchanging message),
+# which is what read as "slow, every single reload." 12s of active-retry
+# budget comfortably covers the measured ~9.7s worst case, so the
+# visibly-retrying loop now handles the realistic cold-mount case instead
+# of silently falling through to that quieter fallback.
+COOKIE_PROBE_MAX_ATTEMPTS = 30
+COOKIE_PROBE_RETRY_DELAY_S = 0.4  # ~12s worst case across all retries
 
 if "cookie_probe_attempts" not in st.session_state:
     st.session_state.cookie_probe_attempts = 0
 if "just_logged_out" not in st.session_state:
     st.session_state.just_logged_out = False
+if "cookie_probe_exhausted" not in st.session_state:
+    st.session_state.cookie_probe_exhausted = False
 
 if st.session_state.get("session_token"):
     # This Python session already knows its own token (e.g. right after a
@@ -281,6 +242,24 @@ elif st.session_state.just_logged_out:
     # don't even ask the cookie, and don't run validate_session against a
     # token we know is already gone. This is what stops the logout click
     # from being able to briefly show a stale/invalid-session error.
+    _session_token = None
+elif st.session_state.cookie_probe_exhausted:
+    # Already gave up resolving the cookie once this browser session --
+    # treat as "no session" rather than mounting the cookie-read
+    # component again. Re-mounting it was the actual bug: the component
+    # function was previously called unconditionally on every single
+    # pass through this branch, including every run AFTER our own retry
+    # budget below was exhausted and had stopped calling st.rerun()
+    # itself. extra_streamlit_components' CookieManager component can
+    # report its value again on its own (not only in direct response to
+    # being re-rendered by us), and Streamlit automatically reruns the
+    # script on ANY reported value from a mounted component -- confirmed
+    # empirically (real browser, WebSocket frames captured) that this
+    # kept the app rerunning indefinitely, with zero user interaction,
+    # long after our own explicit st.rerun() calls had stopped. Never
+    # calling the component again after giving up once is what actually
+    # stops that -- a bounded, one-time retry budget below, followed by
+    # a genuinely final answer, not another indefinite wait.
     _session_token = None
 else:
     _raw_cookies = _cookie_component(method="getAll", key="auth_cookie_manager", default=None)
@@ -298,33 +277,36 @@ else:
         # pattern already used for the Azure SQL retry logic below --
         # so the browser's independent, concurrently-running mount
         # actually gets time to finish.
-        st.markdown(
-            '<div class="manifest-title"><span class="accent-bar"></span>Arbiter</div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(_header_logo_html(), unsafe_allow_html=True)
         if st.session_state.cookie_probe_attempts < COOKIE_PROBE_MAX_ATTEMPTS:
             st.session_state.cookie_probe_attempts += 1
             with st.spinner("Checking session..."):
                 time.sleep(COOKIE_PROBE_RETRY_DELAY_S)
             st.rerun()
 
-        # Exhausted every retry (~2s of real waiting) and it's STILL not
-        # back -- stop guessing with a fixed budget and fall back to
-        # Streamlit's own automatic rerun-on-value-change (built into
-        # every custom component: once the frontend eventually reports a
-        # value that differs from the None default we've seen so far,
-        # Streamlit reruns the script on its own, however long that
-        # takes). We keep showing "Checking session..." rather than ever
-        # falling through to the login screen here, because doing that
-        # on merely-slow-but-genuinely-valid session data is exactly the
-        # bug being fixed -- an occasional longer wait is preferable to
-        # an incorrect logout.
-        st.info("Checking session...")
-        st.stop()
-
-    # _raw_cookies is a real dict now (possibly {}) -- definitive answer.
-    st.session_state.cookie_probe_attempts = 0
-    _session_token = _raw_cookies.get("session_token")
+        # Exhausted every retry (~12s of real waiting) and it's STILL not
+        # back -- conclusively treat this as "no session" (proceed to the
+        # real login screen) instead of parking in "Checking session..."
+        # waiting indefinitely on more messages from the component. That
+        # indefinite wait used to rely on Streamlit's automatic rerun-on-
+        # value-change firing exactly once, when a genuinely slow mount
+        # finally resolves -- but the cookie component doesn't only ever
+        # report once: it can keep posting on its own, and each post
+        # looked like a fresh, legitimate value change, so the "just wait
+        # a bit longer" branch could in practice mean rerunning forever
+        # with the tab sitting idle. A 12s active budget already
+        # comfortably covers real measured mount times (see above), so
+        # concluding here trades an already-rare, self-recoverable edge
+        # case (a hard refresh landing on the login screen despite a
+        # still-valid cookie, fixed by simply reloading again) for
+        # actually going quiet when the script is done, which a
+        # background/idle tab must do.
+        st.session_state.cookie_probe_exhausted = True
+        _session_token = None
+    else:
+        # _raw_cookies is a real dict now (possibly {}) -- definitive answer.
+        st.session_state.cookie_probe_attempts = 0
+        _session_token = _raw_cookies.get("session_token")
 
 # Validated on every single rerun, not just once -- this is what actually
 # enforces the sliding 20-minute inactivity window (each call refreshes
@@ -824,41 +806,13 @@ def load_sample_emails():
         return []
 
 
-ARBITER_HEADER_ICON_SVG_PATH = "assets/arbiter_icon_header.svg"
-
-
-def _load_svg(path: str) -> str:
-    """Reads an SVG asset's raw markup for inline embedding via
-    st.markdown(..., unsafe_allow_html=True). Returns an empty string
-    if the file is missing, so a moved/renamed asset degrades to no
-    logo rather than crashing the page."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        return ""
-
-
 # --- Header ---
 # DB_INIT_ERROR can't be set here -- the auth gate above already st.stop()s
 # on it before this point, so there's no error branch to show.
 header_col, approve_toggle_col, theme_toggle_col, user_col = st.columns([3.2, 1.4, 1, 1.8])
 with header_col:
-    # assets/arbiter_icon_header.svg is the mark alone -- no <title>/<desc>
-    # (which the browser renders as a hover tooltip on the earlier logo
-    # variant) and no background rect (which showed as an unwanted dark
-    # box around the icon). The wordmark is a real HTML element here, not
-    # baked into the SVG, so it can be styled/positioned independently.
-    _arbiter_icon_svg = _load_svg(ARBITER_HEADER_ICON_SVG_PATH)
-    _logo_icon_html = f'<span class="app-header-icon">{_arbiter_icon_svg}</span>' if _arbiter_icon_svg else ""
     st.markdown(
-        f"""
-        <div class="app-header-logo-row">
-            {_logo_icon_html}
-            <span class="app-header-wordmark">Arbiter</span>
-        </div>
-        <div style="margin-top: 8px;">{db_mode_badge_html(DB_MODE, bool(DB_INIT_ERROR))}</div>
-        """,
+        _header_logo_html() + f'<div style="margin-top: 8px;">{db_mode_badge_html(DB_MODE, bool(DB_INIT_ERROR))}</div>',
         unsafe_allow_html=True,
     )
 with approve_toggle_col:
@@ -882,7 +836,8 @@ with user_col:
         st.markdown(
             f"""
             <div style="text-align:right; font-family:'IBM Plex Mono',monospace;
-                        font-size:0.75rem; color:var(--text-dim); padding-top:8px;">
+                        font-size:0.75rem; color:var(--text-dim); padding-top:8px;
+                        padding-bottom:16px;">
                 Logged in as <b style="color:var(--text);">{first_name}</b>
             </div>
             """,

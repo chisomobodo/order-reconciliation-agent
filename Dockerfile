@@ -35,6 +35,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# entrypoint.sh is written with LF line endings and needs the execute
+# bit set explicitly -- NTFS (where this repo is developed) has no
+# concept of a Unix execute permission, so this can't be relied on to
+# already be set just because the file was committed that way.
+RUN chmod +x entrypoint.sh
+
 # This container is always the Azure-backed version -- no point running
 # SQLite inside a stateless container that gets replaced on every deploy.
 ENV USE_AZURE_DB=true
@@ -43,4 +49,8 @@ EXPOSE 8501
 
 HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
 
-ENTRYPOINT ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# entrypoint.sh runs init_db.py (schema setup) to completion BEFORE
+# starting Streamlit -- see entrypoint.sh and init_db.py for why this
+# moved out of the Streamlit request cycle. If schema init fails, the
+# container fails to start instead of serving an uninitialized app.
+ENTRYPOINT ["./entrypoint.sh"]
