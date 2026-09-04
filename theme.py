@@ -1,5 +1,5 @@
 """
-Design system for the Reconciliation Agent dashboard.
+Design system for the Arbiter dashboard.
 
 Concept: a shipping-manifest / dispatch-office aesthetic, not a generic
 analytics dashboard skin. Order IDs and SKUs read like manifest codes
@@ -79,6 +79,16 @@ def build_css(theme_name: str) -> str:
     --danger-ink: {t['danger_ink']};
     --info: {t['info']};
     --info-ink: {t['info_ink']};
+
+    /* Spacing scale -- every section/card gap across every tab should
+       come from one of these, not an ad-hoc pixel value, so the
+       vertical rhythm reads the same regardless of which tab you're
+       looking at. */
+    --space-xs: 4px;
+    --space-sm: 8px;
+    --space-md: 16px;
+    --space-lg: 24px;
+    --space-xl: 32px;
 }}
 
 .stApp {{
@@ -125,6 +135,160 @@ h1, h2, h3 {{
     letter-spacing: 0.04em;
     margin-top: 2px;
     animation: fadeSlideDown 0.6s ease-out;
+}}
+
+/* Main header logo lockup: assets/arbiter_icon_header.svg (the mark
+   alone -- transparent background, no <title>/<desc>, so no unwanted
+   hover tooltip or background box) next to a real HTML wordmark, not
+   text baked into the SVG. Left-aligned as a row (justify-content:
+   flex-start), not centered -- sits toward the left of the header. */
+.app-header-logo-row {{
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 10px;
+    animation: fadeSlideDown 0.5s ease-out;
+}}
+.app-header-icon {{
+    display: inline-flex;
+    width: 52px;
+    flex-shrink: 0;
+}}
+.app-header-icon svg {{ display: block; width: 100%; height: auto; }}
+.app-header-wordmark {{
+    font-family: 'Oswald', sans-serif;
+    font-weight: 700;
+    font-size: 1.9rem;
+    letter-spacing: 0.02em;
+    color: var(--text);
+}}
+
+/* --- Section heading: the ONE style for every top-level named section
+   inside a tab (e.g. "Agent Execution", "Pending Outbound Emails",
+   "Awaiting Customer Reply", "Sent Emails", "Processed Emails") --
+   replaces a previous mix of st.header/st.subheader/bold-markdown that
+   each rendered with different font/size/weight depending on which tab
+   they happened to be added in. Deliberately icon-free (an earlier pass
+   had emoji on some section headings but not others -- inconsistent,
+   and a status is already communicated by the .stamp badges, not by a
+   decorative icon in the heading). */
+.section-heading {{
+    font-family: 'Oswald', sans-serif;
+    font-weight: 700;
+    font-size: 1.25rem;
+    letter-spacing: 0.02em;
+    color: var(--text);
+    margin: var(--space-sm) 0 var(--space-sm) 0;
+    animation: fadeSlideDown 0.4s ease-out;
+}}
+
+/* --- Field label: the smaller, dimmer label for a sub-field WITHIN one
+   section/result (e.g. "Tool Call Chain" / "Outcome" / "Reply to
+   Customer" / "Database Write" are all sub-fields of one Agent
+   Execution result, not independent sections of their own) -- reuses
+   the same IBM Plex Mono uppercase treatment .step-card .step-label
+   already established, instead of inventing a third label style. */
+.field-label {{
+    font-family: 'IBM Plex Mono', monospace;
+    font-weight: 600;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin: var(--space-md) 0 var(--space-xs) 0;
+}}
+
+/* --- Empty state: a designed "nothing here" state, not a bare caption
+   floating in blank space -- used everywhere a list/section can be
+   empty (no pending emails, nothing on hold, etc.) so absence of
+   content still reads as an intentional, finished part of the UI. */
+.empty-state {{
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: var(--space-md);
+    text-align: center;
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 0.88rem;
+    color: var(--text-dim);
+    animation: fadeSlideUp 0.4s ease-out;
+}}
+
+/* --- Compact stamp variant: same badge, smaller/rotated for tight
+   header contexts -- was a one-off inline style before, now a real
+   class so it's defined in one place instead of duplicated per call
+   site. */
+.stamp-compact {{
+    font-size: 0.7rem;
+    padding: 4px 12px;
+    transform: rotate(-2deg);
+}}
+
+/* --- Native Streamlit alert boxes (st.info/st.warning/st.error/
+   st.success) and expanders -- restyled to match the manifest surface/
+   border treatment instead of standing out as unstyled default
+   Streamlit chrome next to the custom cards around them. The kind-
+   specific tint (blue for info, red for error, etc.) actually lives on
+   a NESTED stAlertContainer div with its own translucent background,
+   not on the outer stAlert -- confirmed by inspecting the live DOM,
+   since overriding only the outer container left that inner tint
+   showing through as a mismatched color patch. Neutralized here so
+   every alert reads as one plain surface-alt card regardless of kind;
+   Streamlit's icon (info/warning/error glyph) is left alone, since
+   that alone still carries the semantic signal. */
+[data-testid="stAlert"] {{
+    background: var(--surface-alt) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+}}
+[data-testid="stAlert"] [data-testid="stAlertContainer"] {{
+    background: transparent !important;
+}}
+[data-testid="stAlert"] p {{
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    color: var(--text) !important;
+}}
+[data-testid="stExpander"] {{
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+    background: var(--surface) !important;
+}}
+
+/* Links (e.g. a customer's email address auto-linkified inside a
+   reply-card) default to the browser's blue -- recolored to the
+   accent amber so they read as part of the theme, not a foreign
+   element. */
+.stApp a {{
+    color: var(--accent) !important;
+}}
+
+/* Tab strip -- Streamlit's default active-tab color/underline is red
+   (its own built-in primaryColor), clashing with the amber accent used
+   everywhere else. Confirmed via the live DOM: the tab label itself is
+   [data-testid="stTab"], and the moving underline is a sibling
+   .react-aria-SelectionIndicator, not a border on the tab itself. */
+[data-testid="stTab"] {{
+    color: var(--text-dim) !important;
+    transition: color 0.2s ease;
+}}
+[data-testid="stTab"][aria-selected="true"] {{
+    color: var(--accent) !important;
+}}
+.react-aria-SelectionIndicator {{
+    background: var(--accent) !important;
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}}
+
+/* Tab panel entrance -- confirmed via the frontend bundle that
+   switching tabs never unmounts anything (all panels are
+   shouldForceMount:true); the inactive ones just sit at display:none.
+   Browsers restart an element's CSS animation whenever it re-enters
+   the render tree from display:none, so giving the panel itself an
+   animation is enough to make every tab switch (not just first page
+   load) fade/slide the whole tab's content in -- on top of the
+   step-card/stamp/reply-card/etc. animations already firing the same
+   way for the same reason. */
+[data-testid="stTabPanel"] {{
+    animation: tabPanelIn 0.35s ease-out;
 }}
 
 /* Sidebar as a ledger */
@@ -274,12 +438,20 @@ h1, h2, h3 {{
     60%  {{ opacity: 1; transform: scale(0.95) rotate(-3deg); }}
     100% {{ opacity: 1; transform: scale(1) rotate(-3deg); }}
 }}
+@keyframes tabPanelIn {{
+    from {{ opacity: 0; transform: translateY(6px); }}
+    to   {{ opacity: 1; transform: translateY(0); }}
+}}
 
 @media (prefers-reduced-motion: reduce) {{
-    .step-card, .stamp, .reply-card, .manifest-title, .manifest-sub {{
+    .step-card, .stamp, .reply-card, .manifest-title, .manifest-sub, .app-header-logo-row,
+    .section-heading, .empty-state, [data-testid="stTabPanel"] {{
         animation: none !important;
         opacity: 1 !important;
         transform: none !important;
+    }}
+    [data-testid="stTab"], .react-aria-SelectionIndicator {{
+        transition: none !important;
     }}
 }}
 </style>
@@ -328,3 +500,29 @@ def stamp_html(status: str) -> str:
         "Needs Manual Linking": "stamp-warn",
     }.get(status, "stamp-info")
     return f'<span class="stamp {variant}">{status}</span>'
+
+
+def section_heading_html(text: str) -> str:
+    """The one heading style for every top-level named section inside a
+    tab (e.g. "Agent Execution", "Pending Outbound Emails", "Awaiting
+    Customer Reply") -- use this instead of st.header/st.subheader/bold
+    markdown so every section heading across every tab matches, rather
+    than each rendering with whatever style happened to be reached for
+    when that section was added."""
+    return f'<div class="section-heading">{text}</div>'
+
+
+def field_label_html(text: str) -> str:
+    """The smaller, dimmer label for a sub-field within one section/
+    result (e.g. "Tool Call Chain" / "Outcome" / "Reply to Customer" /
+    "Database Write" are all sub-fields of one Agent Execution result,
+    not independent sections of their own)."""
+    return f'<div class="field-label">{text}</div>'
+
+
+def empty_state_html(text: str) -> str:
+    """A designed 'nothing here' state for any list/section that can be
+    empty -- used in place of a bare st.caption() so absence of content
+    still reads as an intentional, finished part of the UI rather than
+    a blank gap."""
+    return f'<div class="empty-state">{text}</div>'

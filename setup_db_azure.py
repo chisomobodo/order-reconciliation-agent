@@ -1,5 +1,6 @@
 """
-Azure SQL Database setup for the Reconciliation Agent portfolio project.
+Azure SQL Database setup for Arbiter, an AI order-reconciliation agent
+portfolio project.
 
 Same schema and seed data as the local SQLite version (setup_db.py), but
 targets Azure SQL Database via pyodbc instead of a local .db file.

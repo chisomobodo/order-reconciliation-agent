@@ -12,6 +12,21 @@ widgets to capture values -- this module restyles them via CSS rather
 than replacing them with plain HTML.
 """
 
+ARBITER_ICON_SVG_PATH = "assets/arbiter_icon_only.svg"
+
+
+def _load_svg(path: str) -> str:
+    """Reads an SVG asset's raw markup for inline embedding via
+    st.markdown(..., unsafe_allow_html=True). Returns an empty string
+    if the file is missing, so a moved/renamed asset degrades to no
+    logo rather than crashing the auth screen."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
 AUTH_FONTS_IMPORT = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -91,6 +106,16 @@ div[data-testid="stHorizontalBlock"]:has(.auth-hero) > div[data-testid="stColumn
     opacity: 0.25;
     animation: gridDrift 40s linear infinite;
 }}
+.auth-hero-logo {{
+    width: 44px;
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 16px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+    z-index: 1;
+    animation: authSlideUp 0.7s ease-out 0s both;
+}}
+.auth-hero-logo svg {{ display: block; }}
 .auth-hero-tag {{
     font-family: 'IBM Plex Mono', monospace;
     font-size: 0.72rem;
@@ -266,7 +291,7 @@ div[data-testid="stTextInput"] input {{
 }}
 
 @media (prefers-reduced-motion: reduce) {{
-    div[data-testid="stHorizontalBlock"]:has(.auth-hero), .auth-hero-tag,
+    div[data-testid="stHorizontalBlock"]:has(.auth-hero), .auth-hero-logo, .auth-hero-tag,
     .auth-hero-title, .auth-hero-sub, .auth-hero-stamp, .auth-form-title,
     .auth-form-caption, .auth-tabs, div[data-testid="stTextInput"],
     .stButton button[kind="primary"], .auth-message {{
@@ -290,10 +315,13 @@ div[data-testid="stTextInput"] input {{
 
 def hero_panel_html() -> str:
     """The decorative left panel. Pure HTML/CSS, no interactive elements."""
-    return """
+    icon_svg = _load_svg(ARBITER_ICON_SVG_PATH)
+    logo_html = f'<div class="auth-hero-logo">{icon_svg}</div>' if icon_svg else ""
+    return f"""
     <div class="auth-hero">
         <div>
-            <div class="auth-hero-tag">Reconciliation Agent · Access</div>
+            {logo_html}
+            <div class="auth-hero-tag">Arbiter · Access</div>
             <div class="auth-hero-title">Every order,<br/><span class="accent">accounted for.</span></div>
             <div class="auth-hero-sub">
                 Sign in to process live order-change requests, review pending

@@ -6,7 +6,9 @@ reply for each, so the clarification path can be eyeballed.
 Requires mock_erp.db to already exist (run setup_db.py first) and
 ANTHROPIC_API_KEY to be set.
 """
-from agent_engine import run_agent
+from contextlib import closing
+
+from agent_engine import get_connection, run_agent
 
 TEST_EMAILS = {
     "unambiguous (ORD-9941, cider original)": """\
@@ -28,7 +30,8 @@ if __name__ == "__main__":
         print(email.strip())
         print("-" * 70)
 
-        tool_call, result, reply_text = run_agent(email)
+        with closing(get_connection()) as conn:
+            tool_call, result, reply_text = run_agent(conn, email)
 
         if tool_call is None:
             print("No tool called.")

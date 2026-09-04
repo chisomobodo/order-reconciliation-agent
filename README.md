@@ -1,4 +1,4 @@
-# Reconciliation Agent — Portfolio Project
+# Arbiter — an AI order-reconciliation agent
 
 An AI agent that parses messy wholesale order-change emails, checks stock and
 dispatch status against a mock ERP, and either reconciles the order or asks
@@ -203,7 +203,7 @@ To generate one:
 1. Enable 2-Step Verification on the Gmail account, if not already on:
    [myaccount.google.com/security](https://myaccount.google.com/security)
 2. Go to [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
-3. Create an app password (any name, e.g. "Reconciliation Agent") and copy
+3. Create an app password (any name, e.g. "Arbiter") and copy
    the 16-character code it generates — that's `GMAIL_APP_PASSWORD`, not
    the Gmail login password.
 

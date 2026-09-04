@@ -1,5 +1,5 @@
 """
-Authentication module for the Reconciliation Agent app.
+Authentication module for the Arbiter app.
 
 Flow:
   1. Sign up: email + password + name. Password is hashed with bcrypt --
@@ -188,8 +188,8 @@ def _send_code_email(to_email: str, code: str):
         f"This is an automated message, please do not reply to this email."
     )
     msg = MIMEText(body)
-    msg["Subject"] = "Your Reconciliation Agent login code"
-    msg["From"] = formataddr(("Reconciliation Agent", gmail_address))
+    msg["Subject"] = "Your Arbiter login code"
+    msg["From"] = formataddr(("Arbiter", gmail_address))
     # Keeps replies from routing to the personal Gmail inbox sending
     # these -- doesn't need to be a real, resolvable domain, it's just
     # signaling "don't reply here" to the recipient's email client.

@@ -1,5 +1,6 @@
 """
-Mock ERP database for the Reconciliation Agent portfolio project.
+Mock ERP database for Arbiter, an AI order-reconciliation agent
+portfolio project.
 
 This models a fictional beverage wholesale distributor. All company names,
 product names, SKUs, and figures below are invented for demo purposes only.

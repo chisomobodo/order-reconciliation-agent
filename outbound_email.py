@@ -1,5 +1,6 @@
 """
-Approval-gated outbound email sending for the Reconciliation Agent.
+Approval-gated outbound email sending for Arbiter, an AI
+order-reconciliation agent.
 
 Every reply the agent drafts -- clarification questions, order-change
 confirmations, anything -- goes into a queue as a DRAFT first. Nothing
@@ -23,7 +24,7 @@ from email.utils import formataddr
 
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
-SENDER_DISPLAY_NAME = "Reconciliation Agent"
+SENDER_DISPLAY_NAME = "Arbiter"
 
 
 def _default_order_intake_email():

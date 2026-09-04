@@ -5,8 +5,9 @@ the real test of the agent design across a realistic spread of cases,
 not just the two hand-picked examples from earlier.
 """
 import json
+from contextlib import closing
 
-from agent_engine import run_agent
+from agent_engine import get_connection, run_agent
 
 
 def run_batch():
@@ -23,7 +24,8 @@ def run_batch():
         print("-" * 70)
 
         try:
-            extracted, tool_result, reply = run_agent(email["body"])
+            with closing(get_connection()) as conn:
+                extracted, tool_result, reply = run_agent(conn, email["body"])
 
             if not extracted:
                 tool_chain = "NONE"

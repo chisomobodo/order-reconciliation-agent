@@ -1,6 +1,6 @@
 """
-Agent configuration: system prompt + tool definitions for the
-Reconciliation Agent portfolio project.
+Agent configuration: system prompt + tool definitions for Arbiter, an
+AI order-reconciliation agent portfolio project.
 
 Fictional distributor, fictional products — see setup_db.py for the
 mock inventory this prompt assumes.
@@ -40,7 +40,7 @@ Key design decisions (the interview-question answers):
      the ERP again.
 """
 
-SYSTEM_PROMPT = """You are the Autonomous Supply Chain Reconciliation Agent for a beverage wholesale distributor. Your job is to process inbound customer order-adjustment emails.
+SYSTEM_PROMPT = """You are Arbiter, the Autonomous Supply Chain Reconciliation Agent for a beverage wholesale distributor. Your job is to process inbound customer order-adjustment emails.
 
 You must follow these strict operational rules:
 

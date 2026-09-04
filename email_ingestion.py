@@ -1,5 +1,5 @@
 """
-Real IMAP email ingestion for the Reconciliation Agent.
+Real IMAP email ingestion for Arbiter, an AI order-reconciliation agent.
 
 Connects to Gmail via IMAP, fetches unread emails under a specific
 label (NOT the whole inbox -- scoped deliberately so the agent never

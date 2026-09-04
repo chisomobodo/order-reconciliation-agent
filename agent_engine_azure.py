@@ -1,6 +1,6 @@
 """
-Backend orchestration for the Reconciliation Agent portfolio project --
-Azure SQL Database version.
+Backend orchestration for Arbiter, an AI order-reconciliation agent
+portfolio project -- Azure SQL Database version.
 
 Identical logic to agent_engine.py (the local SQLite version) -- same
 multi-step tool loop, same check/commit split for the approval gate --
@@ -258,10 +258,16 @@ def _execute_tool(conn, tool_name, tool_inputs):
     return {"status": "Error", "message": f"Unknown tool: {tool_name}"}, False
 
 
-def run_agent(conn, email_text):
+def run_agent(conn, email_text, on_step=None):
     """Orchestrates a multi-step tool-use loop against Azure SQL Database.
     Takes an already-open connection, threaded through to every tool
-    call made during the loop -- caller owns its lifecycle."""
+    call made during the loop -- caller owns its lifecycle.
+
+    on_step, if given, is called as on_step(tool_name) right after each
+    tool call completes -- lets a caller (e.g. app.py, driving an
+    st.status() widget) show live per-step progress instead of one
+    generic spinner for the whole loop. Optional and defaults to None so
+    every existing caller keeps working unchanged."""
 
     messages = [{"role": "user", "content": email_text}]
     tool_call_log = []
@@ -288,6 +294,9 @@ def run_agent(conn, email_text):
 
         result, should_stop = _execute_tool(conn, tool_name, tool_inputs)
         tool_call_log.append({"tool_called": tool_name, "inputs": tool_inputs, "result": result})
+
+        if on_step is not None:
+            on_step(tool_name)
 
         if should_stop:
             return tool_call_log, result, result["message"]

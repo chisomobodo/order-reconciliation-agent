@@ -1,5 +1,6 @@
 """
-Interview demo dashboard for the Reconciliation Agent portfolio project.
+Interview demo dashboard for Arbiter -- an AI order-reconciliation
+agent portfolio project.
 
 Design concept: a shipping-manifest / dispatch-office aesthetic (see
 theme.py) -- monospace order/SKU codes, stamped status badges, and a
@@ -27,9 +28,17 @@ import auth_theme
 import email_ingestion
 import hold_requests
 import outbound_email
-from theme import build_css, email_card_html, step_card_html, stamp_html
+from theme import (
+    build_css,
+    email_card_html,
+    empty_state_html,
+    field_label_html,
+    section_heading_html,
+    step_card_html,
+    stamp_html,
+)
 
-st.set_page_config(layout="wide", page_title="Reconciliation Agent", page_icon="📦")
+st.set_page_config(layout="wide", page_title="Arbiter", page_icon="assets/arbiter_favicon.png")
 
 # --- Backend selection: local SQLite (fast iteration) vs Azure SQL (cloud
 # demo). USE_AZURE_DB=true switches both the agent's tool backend and the
@@ -115,15 +124,22 @@ st.markdown(build_css(st.session_state.theme), unsafe_allow_html=True)
 # login form that would just fail on every attempt.
 if DB_INIT_ERROR:
     st.markdown(
-        '<div class="manifest-title"><span class="accent-bar"></span>Reconciliation Agent</div>',
+        '<div class="manifest-title"><span class="accent-bar"></span>Arbiter</div>',
         unsafe_allow_html=True,
     )
-    st.error(
-        f"USE_AZURE_DB is set, but the app couldn't connect to Azure SQL: {DB_INIT_ERROR}\n\n"
-        "Check that AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, and "
-        "AZURE_SQL_PASSWORD are set correctly, then restart the app. Or set "
-        "USE_AZURE_DB=false (or unset it) to fall back to the local SQLite backend."
-    )
+    # Clean, simple primary message for the end user -- the actual
+    # exception and the env vars to check are real diagnostic info
+    # (useful to whoever runs/deploys this), but they're internal
+    # detail that doesn't belong in front of someone just trying to use
+    # the app, so they're tucked behind an explicit expander instead.
+    st.error("Couldn't connect to the database. Please try again shortly.")
+    with st.expander("Technical details"):
+        st.markdown(
+            f"USE_AZURE_DB is set, but the app couldn't connect to Azure SQL: {DB_INIT_ERROR}\n\n"
+            "Check that AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, and "
+            "AZURE_SQL_PASSWORD are set correctly, then restart the app. Or set "
+            "USE_AZURE_DB=false (or unset it) to fall back to the local SQLite backend."
+        )
     st.stop()
 
 
@@ -204,7 +220,7 @@ def _ensure_hold_requests_schema():
 
 
 try:
-    with st.spinner(f"Connecting to {DB_MODE}..."):
+    with st.spinner("Connecting..."):
         _ensure_auth_schema()
         _ensure_email_tracking_schema()
         _ensure_outbound_email_schema()
@@ -214,17 +230,19 @@ except Exception as e:
     # message instead of the raw traceback Streamlit would otherwise
     # render for an uncaught exception this early in the script.
     st.markdown(
-        '<div class="manifest-title"><span class="accent-bar"></span>Reconciliation Agent</div>',
+        '<div class="manifest-title"><span class="accent-bar"></span>Arbiter</div>',
         unsafe_allow_html=True,
     )
-    st.error(
-        f"Could not connect to {DB_MODE} to set up the database after "
-        f"{STARTUP_DB_MAX_ATTEMPTS} attempts: {e}\n\n"
-        "This is usually a transient cold-start delay -- reloading the page in "
-        "a few moments often resolves it. If it keeps happening, check that "
-        "AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, and "
-        "AZURE_SQL_PASSWORD are all correct."
-    )
+    st.error("Couldn't connect to the database after several attempts. Please try again shortly.")
+    with st.expander("Technical details"):
+        st.markdown(
+            f"Could not connect to {DB_MODE} to set up the database after "
+            f"{STARTUP_DB_MAX_ATTEMPTS} attempts: {e}\n\n"
+            "This is usually a transient cold-start delay -- reloading the page in "
+            "a few moments often resolves it. If it keeps happening, check that "
+            "AZURE_SQL_SERVER, AZURE_SQL_DATABASE, AZURE_SQL_USERNAME, and "
+            "AZURE_SQL_PASSWORD are all correct."
+        )
     st.stop()
 
 # --- Session cookie: read side ---
@@ -281,7 +299,7 @@ else:
         # so the browser's independent, concurrently-running mount
         # actually gets time to finish.
         st.markdown(
-            '<div class="manifest-title"><span class="accent-bar"></span>Reconciliation Agent</div>',
+            '<div class="manifest-title"><span class="accent-bar"></span>Arbiter</div>',
             unsafe_allow_html=True,
         )
         if st.session_state.cookie_probe_attempts < COOKIE_PROBE_MAX_ATTEMPTS:
@@ -311,9 +329,30 @@ else:
 # Validated on every single rerun, not just once -- this is what actually
 # enforces the sliding 20-minute inactivity window (each call refreshes
 # last_active_at) rather than trusting a stale login forever.
+#
+# Cached for SESSION_VALIDATION_TTL_S (@st.cache_data, same pattern as
+# get_db_snapshot below): validate_session()'s own query is cheap, but
+# the connection it needs is not -- opening a fresh one costs low
+# single-digit ms on local SQLite (invisible) but several real seconds
+# against Azure SQL (confirmed: a bare get_connection() call there took
+# ~6.4s). Before this cache, that connection was opened fresh on EVERY
+# rerun -- every reload, every button click, every widget interaction
+# -- which blocked the entire page behind that multi-second wait right
+# after the header, before the auth screen or dashboard could render.
+# The sliding window still works, just refreshed at most once per TTL
+# instead of on literally every rerun -- a few-second slack on a
+# 20-minute inactivity timeout, not a meaningful security loosening.
+SESSION_VALIDATION_TTL_S = 20
+
+
+@st.cache_data(ttl=SESSION_VALIDATION_TTL_S)
+def _validate_session_cached(session_token: str) -> dict:
+    with closing(auth_get_connection()) as conn:
+        return auth.validate_session(conn, session_token)
+
+
 if _session_token:
-    with closing(auth_get_connection()) as _conn:
-        _session_check = auth.validate_session(_conn, _session_token)
+    _session_check = _validate_session_cached(_session_token)
 else:
     _session_check = {"status": "Invalid"}
 
@@ -489,6 +528,26 @@ def find_clarification_request(tool_log):
     return None
 
 
+TOOL_STEP_LABELS = {
+    "get_order_details": "Checking order details...",
+    "verify_order_modification": "Verifying feasibility against stock and dispatch status...",
+    "request_clarification": "Product reference is ambiguous — preparing a clarifying question...",
+}
+
+
+def _make_status_step_callback(status):
+    """Returns an on_step(tool_name) callback bound to an st.status()
+    widget -- passed into run_agent() so each tool call, as it actually
+    completes, appends a human-readable line to the status box instead
+    of the user seeing one generic spinner for the whole multi-step
+    loop. Unknown tool names (shouldn't happen -- there are only three)
+    still get a sensible fallback line rather than silently doing
+    nothing."""
+    def on_step(tool_name):
+        status.write(TOOL_STEP_LABELS.get(tool_name, f"Running {tool_name}..."))
+    return on_step
+
+
 def _build_combined_context(hold: dict, new_reply_body: str) -> str:
     """Builds the full context run_agent() needs when a fetched email is
     a reply to an existing Hold -- the customer's new reply alone (often
@@ -532,8 +591,11 @@ def _run_agent_and_dispatch(conn, agent_input: str, item: dict, sender_address: 
     retried rather than silently lost to a transient failure (e.g. a
     dropped Claude API call)."""
     try:
-        tool_log, final_result, reply = run_agent(conn, agent_input)
+        with st.status("Processing email...", expanded=True) as status:
+            tool_log, final_result, reply = run_agent(conn, agent_input, on_step=_make_status_step_callback(status))
+            status.update(label="Done", state="complete")
     except Exception as e:
+        status.update(label="Done", state="error")
         st.session_state.last_result = {"error": str(e)}
         return
 
@@ -691,15 +753,16 @@ def _process_pending_email(conn, item):
 
 
 def db_mode_badge_html(mode: str, has_error: bool) -> str:
-    """Small stamp badge for the header showing which DB backend is live.
-    Reuses the existing .stamp CSS classes from theme.py rather than
-    introducing a new component."""
+    """Small stamp badge for the header showing whether the backend is
+    reachable. Deliberately doesn't name the actual backend (Azure SQL /
+    local SQLite) -- that's an internal infrastructure detail, not
+    something an end user of the app needs to see; `mode` is still
+    accepted so callers don't need to change, it's just no longer
+    rendered into the visible label. Reuses the existing .stamp CSS
+    classes from theme.py rather than introducing a new component."""
     variant = "stamp-danger" if has_error else "stamp-info"
-    label = f"{mode} · CONNECTION ERROR" if has_error else mode
-    return (
-        f'<span class="stamp {variant}" '
-        f'style="font-size:0.7rem; padding:4px 12px; transform: rotate(-2deg);">{label}</span>'
-    )
+    label = "CONNECTION ERROR" if has_error else "CONNECTED"
+    return f'<span class="stamp stamp-compact {variant}">{label}</span>'
 
 
 DB_SNAPSHOT_MAX_ATTEMPTS = 5  # Azure SQL only -- see get_db_snapshot
@@ -761,15 +824,39 @@ def load_sample_emails():
         return []
 
 
+ARBITER_HEADER_ICON_SVG_PATH = "assets/arbiter_icon_header.svg"
+
+
+def _load_svg(path: str) -> str:
+    """Reads an SVG asset's raw markup for inline embedding via
+    st.markdown(..., unsafe_allow_html=True). Returns an empty string
+    if the file is missing, so a moved/renamed asset degrades to no
+    logo rather than crashing the page."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
 # --- Header ---
 # DB_INIT_ERROR can't be set here -- the auth gate above already st.stop()s
 # on it before this point, so there's no error branch to show.
 header_col, approve_toggle_col, theme_toggle_col, user_col = st.columns([3.2, 1.4, 1, 1.8])
 with header_col:
+    # assets/arbiter_icon_header.svg is the mark alone -- no <title>/<desc>
+    # (which the browser renders as a hover tooltip on the earlier logo
+    # variant) and no background rect (which showed as an unwanted dark
+    # box around the icon). The wordmark is a real HTML element here, not
+    # baked into the SVG, so it can be styled/positioned independently.
+    _arbiter_icon_svg = _load_svg(ARBITER_HEADER_ICON_SVG_PATH)
+    _logo_icon_html = f'<span class="app-header-icon">{_arbiter_icon_svg}</span>' if _arbiter_icon_svg else ""
     st.markdown(
         f"""
-        <div class="manifest-title"><span class="accent-bar"></span>Reconciliation Agent</div>
-        <div class="manifest-sub">PORTFOLIO PROTOTYPE · CLAUDE SONNET 5 · FICTIONAL COMPANY, FICTIONAL DATA</div>
+        <div class="app-header-logo-row">
+            {_logo_icon_html}
+            <span class="app-header-wordmark">Arbiter</span>
+        </div>
         <div style="margin-top: 8px;">{db_mode_badge_html(DB_MODE, bool(DB_INIT_ERROR))}</div>
         """,
         unsafe_allow_html=True,
@@ -805,6 +892,16 @@ with user_col:
         if st.button("Log out", type="secondary", use_container_width=True):
             with closing(auth_get_connection()) as _conn:
                 auth.log_out(_conn, st.session_state.get("session_token"))
+            # Evicts just this token's cached _validate_session_cached()
+            # result. Without this, another tab/session still holding this
+            # same now-deleted token in ITS OWN session_state (so it never
+            # touches the cookie/rerun-gate above at all -- see the
+            # `if st.session_state.get("session_token")` short-circuit near
+            # the top of the file) would keep reading a stale "Valid"
+            # result out of the cache for up to SESSION_VALIDATION_TTL_S
+            # more seconds after this logout, instead of finding out on its
+            # very next rerun the way it did before that cache existed.
+            _validate_session_cached.clear(st.session_state.get("session_token"))
             # Not cookie_manager.delete() -- it does `del self.cookies[cookie]`
             # internally, which raises KeyError whenever that key isn't
             # already present in the manager's local dict (e.g. if the
@@ -862,7 +959,7 @@ with tab_process:
                 email_body = st.text_area("Email content:", value=sample_emails[idx]["body"], height=200)
                 original_subject = sample_emails[idx]["subject"]
         else:
-            st.info("No sample_emails.json found — run generate_test_emails.py first for pre-built test cases.")
+            st.info("No sample test cases available — write your own email below.")
             email_body = st.text_area("Email content:", height=200, placeholder="Paste or type a customer email here...")
             original_subject = "Your Order"
 
@@ -878,14 +975,15 @@ with tab_process:
         run_clicked = st.button(
             "Process with Agent",
             type="primary",
+            use_container_width=True,
             disabled=not email_body.strip() or not sender_email.strip() or bool(DB_INIT_ERROR),
         )
 
     with pe_col2:
-        st.subheader("Agent Execution")
+        st.markdown(section_heading_html("Agent Execution"), unsafe_allow_html=True)
 
         if run_clicked:
-            with st.spinner("Agent reasoning and calling tools..."):
+            with st.status("Processing email...", expanded=True) as status:
                 try:
                     # One connection for this whole action -- run_agent's
                     # internal tool calls (get_order_details, verify_order_
@@ -894,7 +992,10 @@ with tab_process:
                     # instead of each opening (and paying the Azure SQL
                     # handshake cost for) its own.
                     with closing(auth_get_connection()) as conn:
-                        tool_log, final_result, reply = run_agent(conn, email_body)
+                        tool_log, final_result, reply = run_agent(
+                            conn, email_body, on_step=_make_status_step_callback(status)
+                        )
+                        status.update(label="Done", state="complete")
                         # Persist to session_state so this survives the
                         # st.rerun() below (used to refresh the sidebar
                         # tables) instead of vanishing the moment the
@@ -988,6 +1089,7 @@ with tab_process:
                                 st.session_state.pending_approval = verified_change
                             st.rerun()
                 except Exception as e:
+                    status.update(label="Done", state="error")
                     st.session_state.last_result = {"error": str(e)}
 
         if "last_result" in st.session_state:
@@ -1000,33 +1102,41 @@ with tab_process:
                 final_result = result["final_result"]
                 reply = result["reply"]
 
-                st.markdown("**Tool Call Chain**")
+                st.markdown(field_label_html("Tool Call Chain"), unsafe_allow_html=True)
                 if not tool_log:
                     st.markdown(stamp_html("No Action"), unsafe_allow_html=True)
                     st.caption("Claude replied without taking any action.")
                 else:
                     for i, call in enumerate(tool_log, 1):
-                        status = call["result"].get("status", "?")
+                        # Named tool_status, not status -- this used to
+                        # shadow the st.status() widget object bound
+                        # above (`with st.status(...) as status:`).
+                        # Harmless today (that `with` block has already
+                        # exited by the time this loop runs), but fragile
+                        # -- a future edit calling status.update() after
+                        # this loop would silently call .update() on a
+                        # plain string instead.
+                        tool_status = call["result"].get("status", "?")
                         detail_lines = [f"{k}: {v}" for k, v in call["inputs"].items()]
-                        detail_lines.append(f"→ {status}")
+                        detail_lines.append(f"→ {tool_status}")
                         detail = "\n".join(detail_lines)
                         st.markdown(
-                            step_card_html(i, call["tool_called"], status, detail, delay_s=(i - 1) * 0.12),
+                            step_card_html(i, call["tool_called"], tool_status, detail, delay_s=(i - 1) * 0.12),
                             unsafe_allow_html=True,
                         )
 
                 final_status = final_result.get("status", "?") if final_result else "No Action"
 
-                st.markdown("**Outcome**")
+                st.markdown(field_label_html("Outcome"), unsafe_allow_html=True)
                 st.markdown(stamp_html(final_status), unsafe_allow_html=True)
 
-                st.markdown("**Reply to Customer**")
+                st.markdown(field_label_html("Reply to Customer"), unsafe_allow_html=True)
                 st.markdown(f'<div class="reply-card">{reply}</div>', unsafe_allow_html=True)
 
                 # --- Human approval gate for the database write ---
                 if st.session_state.pending_approval:
                     pending = st.session_state.pending_approval
-                    st.markdown("**Database Write**")
+                    st.markdown(field_label_html("Database Write"), unsafe_allow_html=True)
                     st.markdown(stamp_html("Pending Approval"), unsafe_allow_html=True)
                     st.markdown(
                         f"""<div class="reply-card">
@@ -1059,7 +1169,7 @@ with tab_process:
                             st.rerun()
                 elif st.session_state.last_commit_result:
                     commit_result = st.session_state.last_commit_result
-                    st.markdown("**Database Write**")
+                    st.markdown(field_label_html("Database Write"), unsafe_allow_html=True)
                     st.markdown(stamp_html(commit_result.get("status", "?")), unsafe_allow_html=True)
                     st.caption(commit_result.get("message", ""))
 
@@ -1067,9 +1177,8 @@ with tab_process:
             st.info("Select or write an email on the left, then click **Process with Agent**.")
 
 with tab_inbox:
-    st.subheader("Inbound Email")
+    st.markdown(section_heading_html("Inbound Email"), unsafe_allow_html=True)
 
-    st.caption(f"Real customer emails, pulled from Gmail's \"{email_ingestion.IMAP_LABEL}\" label.")
     check_inbox_clicked = st.button(
         "📥 Check Inbox for New Orders",
         type="secondary",
@@ -1115,7 +1224,7 @@ with tab_inbox:
         pending_emails = email_ingestion.get_pending_emails(conn)
 
         if pending_emails:
-            st.markdown(f"**{len(pending_emails)} email(s) pending processing:**")
+            st.markdown(field_label_html(f"{len(pending_emails)} email(s) pending processing"), unsafe_allow_html=True)
             process_all_clicked = st.button(
                 "▶️ Process All",
                 type="primary",
@@ -1136,7 +1245,7 @@ with tab_inbox:
                     ),
                     unsafe_allow_html=True,
                 )
-                if st.button("Process", key=f"process_ingested_{item['uid']}"):
+                if st.button("Process", key=f"process_ingested_{item['uid']}", use_container_width=True):
                     process_this_uid = item["uid"]
 
             # Only one of these can actually be true on any given run --
@@ -1151,15 +1260,16 @@ with tab_inbox:
                 _process_pending_email(conn, item)
                 st.rerun()
         else:
-            st.caption("No emails currently pending processing.")
+            st.markdown(empty_state_html("No emails currently pending processing."), unsafe_allow_html=True)
 
     if st.session_state.pending_approval_queue:
+        st.divider()
         pending = st.session_state.pending_approval_queue[0]
         remaining = len(st.session_state.pending_approval_queue)
-        label = "**Database Write — from inbox**"
+        label = "Database Write — from inbox"
         if remaining > 1:
             label += f" ({remaining} awaiting review)"
-        st.markdown(label)
+        st.markdown(field_label_html(label), unsafe_allow_html=True)
         st.markdown(stamp_html("Pending Approval"), unsafe_allow_html=True)
         st.markdown(
             f"""<div class="reply-card">
@@ -1195,8 +1305,7 @@ with tab_inbox:
                 st.rerun()
 
 with tab_outbound:
-    st.markdown("**📤 Pending Outbound Emails**")
-    st.caption("Every drafted reply is queued here for approval before it's ever sent -- same gate as a database write.")
+    st.markdown(section_heading_html("Pending Outbound Emails"), unsafe_allow_html=True)
     # One connection for both read-only queries that render this tab
     # (the pending queue and the sent-log audit trail below), instead of
     # a separate connection for each.
@@ -1234,24 +1343,19 @@ with tab_outbound:
                     st.rerun()
             st.divider()
     else:
-        st.caption("No outbound emails currently pending approval.")
+        st.markdown(empty_state_html("No outbound emails currently pending approval."), unsafe_allow_html=True)
 
     st.divider()
-    st.header("Sent Emails")
-    st.caption("Permanent audit log of every outbound email actually sent -- nothing here was sent without an explicit Approve & Send click.")
+    st.markdown(section_heading_html("Sent Emails"), unsafe_allow_html=True)
     if sent_log:
         sent_df = pd.DataFrame(sent_log)[["to_email", "subject", "sent_at"]]
         sent_df.columns = ["Recipient", "Subject", "Sent At"]
         st.dataframe(sent_df, use_container_width=True, hide_index=True)
     else:
-        st.caption("No emails sent yet.")
+        st.markdown(empty_state_html("No emails sent yet."), unsafe_allow_html=True)
 
 with tab_hold:
-    st.markdown("**⏳ Awaiting Customer Reply**")
-    st.caption(
-        "Orders on hold pending an answer to a clarifying question -- nothing here is ever "
-        "auto-processed, regardless of how long it waits."
-    )
+    st.markdown(section_heading_html("Awaiting Customer Reply"), unsafe_allow_html=True)
     # One connection for every read-only query that renders this tab
     # (all three sections below, including the per-candidate lookup
     # inside the Needs Manual Linking loop) -- previously each of these
@@ -1292,13 +1396,10 @@ with tab_hold:
             )
             st.divider()
     else:
-        st.caption("No orders currently on hold.")
+        st.markdown(empty_state_html("No orders currently on hold."), unsafe_allow_html=True)
 
-    st.markdown("**🚨 Needs Attention**")
-    st.caption(
-        "Holds where the follow-up window has passed with no reply -- a human needs to "
-        "decide what happens next. (Empty until the scheduled follow-up job exists.)"
-    )
+    st.divider()
+    st.markdown(section_heading_html("Needs Attention"), unsafe_allow_html=True)
     if past_follow_up:
         for hold in past_follow_up:
             st.markdown(stamp_html("Past Follow-Up"), unsafe_allow_html=True)
@@ -1336,13 +1437,10 @@ with tab_hold:
                 st.rerun()
             st.divider()
     else:
-        st.caption("Nothing needs attention right now.")
+        st.markdown(empty_state_html("Nothing needs attention right now."), unsafe_allow_html=True)
 
-    st.markdown("**🔗 Needs Manual Linking**")
-    st.caption(
-        "This sender has more than one order on hold, so which one this reply belongs to "
-        "can't be determined automatically -- pick the right one, or treat it as a new request."
-    )
+    st.divider()
+    st.markdown(section_heading_html("Needs Manual Linking"), unsafe_allow_html=True)
     if manual_linking_items:
         for ml_item in manual_linking_items:
             ml_sender_address = parseaddr(ml_item["sender"])[1] or ml_item["sender"]
@@ -1380,7 +1478,7 @@ with tab_hold:
                 # The candidate holds that made this ambiguous may have
                 # since been resolved by the time a human looks at it --
                 # nothing left to link to.
-                st.caption("No open holds from this sender remain.")
+                st.markdown(empty_state_html("No open holds from this sender remain."), unsafe_allow_html=True)
 
             if st.button(
                 "Not a reply — treat as new request",
@@ -1393,7 +1491,7 @@ with tab_hold:
                 st.rerun()
             st.divider()
     else:
-        st.caption("Nothing needs manual linking right now.")
+        st.markdown(empty_state_html("Nothing needs manual linking right now."), unsafe_allow_html=True)
 
 # --- Sidebar: live ERP ledger ---
 # Rendered last, after the header/CSS/toggles and the main email/agent
@@ -1406,20 +1504,18 @@ with tab_hold:
 # where it appears on screen, only when its content becomes available.
 with st.sidebar:
     st.header("Live ERP State")
-    with st.spinner(f"Connecting to {DB_MODE}..."):
+    with st.spinner("Connecting..."):
         inv, ords, db_error = get_db_snapshot()
     if db_error:
-        st.error(f"Could not load {DB_MODE} state:\n\n{db_error}")
+        st.error(f"Could not load live data:\n\n{db_error}")
     else:
         st.subheader("Inventory")
         st.dataframe(inv, use_container_width=True, hide_index=True)
         st.subheader("Orders")
         st.dataframe(ords, use_container_width=True, hide_index=True)
-    st.caption(f"Backend: {DB_MODE}. Refreshes automatically after each successful reconciliation.")
 
 with tab_history:
-    st.header("Processed Emails")
-    st.caption("Reference log of every inbox email run through the agent -- viewable anytime, not just right after processing.")
+    st.markdown(section_heading_html("Processed Emails"), unsafe_allow_html=True)
     with closing(auth_get_connection()) as conn:
         processed_emails = email_ingestion.get_processed_emails(conn)
     if processed_emails:
@@ -1427,4 +1523,4 @@ with tab_history:
         processed_df.columns = ["Sender", "Subject", "Status", "Processed At"]
         st.dataframe(processed_df, use_container_width=True, hide_index=True)
     else:
-        st.caption("No emails processed yet.")
+        st.markdown(empty_state_html("No emails processed yet."), unsafe_allow_html=True)
