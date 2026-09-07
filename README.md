@@ -1,10 +1,14 @@
 # Arbiter — an AI order-reconciliation agent
 
-An AI agent that parses messy wholesale order-change emails, checks stock and
-dispatch status against a mock ERP, and either reconciles the order or asks
-for clarification when a product reference is genuinely ambiguous. Every
-database write goes through a human-approval gate before it happens — Claude
-can check whether a change is feasible, but it can never apply one itself.
+An AI agent that reads real customer order-change emails (via IMAP), checks
+stock and dispatch status against a mock ERP, and either reconciles the order
+or asks for clarification when a product reference is genuinely ambiguous —
+placing the order "on hold" and matching a later reply back to it
+automatically. Sits behind real authentication (signup, password + emailed
+code, sessions), and nothing it decides takes effect unreviewed: every
+database write and every outbound email goes through a human-approval gate —
+Claude can check whether a change is feasible and draft a reply, but it can
+never apply the write or send the email itself.
 
 **Fictional company, fictional data.** Not built for or with any real
 company's data or systems — the distributor and products in `setup_db.py`
@@ -70,10 +74,11 @@ are invented.
       or a unique sender match), and a genuinely ambiguous case is
       queued for a human to link manually rather than guessed at; see
       "Hold State & Reply Matching" below
-- [x] Scheduled follow-up job (`check_holds.py`) — a standalone,
-      independently-run script (intended as an Azure Container Apps Job,
-      not a background thread) that drafts an honest "still on hold"
-      follow-up for any Hold that's gone unanswered past
+- [x] Follow-up job for stale Holds (`check_holds.py`) — a standalone
+      script (built and tested, intended to eventually run as a
+      scheduled Azure Container Apps Job — see "Limitations" below for
+      its current on-demand-only status) that drafts an honest "still
+      on hold" follow-up for any Hold that's gone unanswered past
       `FOLLOW_UP_WINDOW_MINUTES`; still fully gated behind human
       approval, never auto-sent
 - [x] Dashboard reorganized into tabs — Process Email, Inbox, Outbound
@@ -119,14 +124,17 @@ auth_theme.py                    Login/sign-up screen design, restyled in the ap
 email_ingestion.py                Real IMAP ingestion of customer emails from a Gmail label
 outbound_email.py                  Approval-gated outbound email queue (draft -> human approves -> sent)
 hold_requests.py                    Hold-state tracking + four-layer reply-to-clarification matching
-check_holds.py                       Standalone scheduled job: drafts follow-ups for overdue Holds
+check_holds.py                       Standalone script: drafts follow-ups for overdue Holds
+init_db.py                            Schema init for auth/inbox/outbound/hold tables (run once, before app.py)
 setup_db.py                     Mock ERP schema + seed data (SQLite)
 setup_db_azure.py                Mock ERP schema + seed data (Azure SQL)
 generate_test_emails.py           Generates sample_emails.json via Claude
 run_batch_test.py                  Batch-runs sample_emails.json through the agent
 test_agent.py                       Quick manual test (2 hand-picked emails)
 test_azure_connection.py             Sanity check for the Azure SQL backend
-Dockerfile                            Container build (Python 3.11, ODBC Driver 18)
+assets/                                Arbiter branding: header/hero icons, favicon
+Dockerfile                            Container build (Python 3.11 bookworm, ODBC Driver 18)
+entrypoint.sh                          Container entrypoint: runs init_db.py, then starts Streamlit
 .dockerignore                          Excludes venv, local DB, .env, etc. from the build context
 requirements.txt                        Python dependencies
 ```
@@ -138,8 +146,18 @@ python3 -m venv venv
 source venv/bin/activate  # or venv\Scripts\activate on Windows
 pip install -r requirements.txt
 export ANTHROPIC_API_KEY=your_key_here  # or set in your shell profile
-python3 setup_db.py
+python3 setup_db.py   # mock ERP schema + seed data (products, orders, stock)
+python3 init_db.py    # app schema: auth/session, inbox-tracking, outbound-email
+                       # queue, hold-requests tables
 ```
+
+These are two separate one-time scripts because they own different tables:
+`setup_db.py` seeds the mock ERP the agent reasons about; `init_db.py` creates
+everything the app itself needs to run (login, email tracking, the approval
+queue, Hold state). `init_db.py` used to run automatically inside `app.py` on
+first page load — it's now a required, separate step (see "Design notes"
+below for why), so **`streamlit run app.py` will fail without it** if this is
+a first-time setup.
 
 Run the dashboard:
 
@@ -207,10 +225,13 @@ To generate one:
    the 16-character code it generates — that's `GMAIL_APP_PASSWORD`, not
    the Gmail login password.
 
-The `users` / `login_codes` / `sessions` tables are created automatically
-on first run (`auth.init_auth_schema`, called once per process at
-startup), in whichever database `USE_AZURE_DB` currently points at — no
-separate setup script needed.
+The `users` / `login_codes` / `sessions` tables (along with every other
+app-owned table — inbox tracking, the outbound-email queue, hold
+requests) are created by `init_db.py`, run once before `streamlit run
+app.py` (see "Setup" above), in whichever database `USE_AZURE_DB`
+currently points at. This used to run automatically inside `app.py`
+itself on first page load; it's now a standalone prerequisite step
+instead — see "Design notes" below.
 
 The login/sign-up screen (`auth_theme.py`) is styled directly on
 Streamlit's own DOM (`stHorizontalBlock`/`stColumn`/`stTextInputRootElement`)
@@ -340,11 +361,13 @@ ambiguous, the agent's new question is sent back to the customer as an
 ordinary reply — the original Hold is not left open or replaced with a
 second one in this version.
 
-The scheduled follow-up job (`check_holds.py`) is a standalone script —
-run manually (`python3 check_holds.py`) or on a schedule as an **Azure
-Container Apps Job**, deliberately *not* a background thread inside the
-web app, since Container Apps scales the web app to zero on idle, which
-would silently kill any in-process thread too. Past
+The follow-up job (`check_holds.py`) is a standalone script, run on
+demand today (`python3 check_holds.py`) — it's written and tested, and
+designed to eventually run as a scheduled **Azure Container Apps Job**,
+deliberately *not* a background thread inside the web app (Container
+Apps scales the web app to zero on idle, which would silently kill any
+in-process thread too), but that scheduled deployment isn't set up yet;
+see "Limitations" below. Past
 `FOLLOW_UP_WINDOW_MINUTES` (default 30) with no reply, it drafts an
 honest follow-up — "this remains on hold until we hear from you," never
 "we've gone ahead and processed it" — queues it the normal
@@ -376,11 +399,46 @@ Container Registry and deployed via the Azure CLI. This was necessary
 because ACR Tasks (Azure's remote build service) is restricted on Azure for
 Students subscriptions.
 
+Deploy pinned to the exact image digest, **not** the mutable `:latest` tag:
+
+```bash
+docker build -t reconciliation-agent .
+az acr login --name ca289d1c4e31acr
+docker tag reconciliation-agent ca289d1c4e31acr.azurecr.io/reconciliation-agent:latest
+docker push ca289d1c4e31acr.azurecr.io/reconciliation-agent:latest
+# docker push's final line looks like: latest: digest: sha256:<digest>
+
+az containerapp update --name reconciliation-agent --resource-group reconciliation-agent-rg \
+  --image "ca289d1c4e31acr.azurecr.io/reconciliation-agent@sha256:<digest>"
+```
+
+(Container/registry/resource-group names still use the pre-rebrand
+`reconciliation-agent` naming — real Azure resource identifiers, not
+display branding, left as-is deliberately rather than migrated as part
+of a code change.)
+
+The digest pin is not optional, and cost real debugging time to learn:
+`az containerapp update --image ...:latest` does **not** reliably restart
+a running replica just because `:latest` now points to different content
+in the registry. Confirmed directly — a `docker push` succeeded with a
+genuinely new digest, `az containerapp update` reported
+`"provisioningState": "Succeeded"`, and the running container had still
+not restarted (`az containerapp replica list` showed the same
+multi-day-old start timestamp, `restartCount: 0`). Azure Container Apps
+only triggers a real restart when the image *reference string itself*
+changes — since `:latest` is always the same string, repeated deploys
+against it can silently leave stale code running indefinitely while
+every individual step reports success. A digest is a different string
+on every push, so pinning to it is what actually guarantees a deploy
+takes effect.
+
 ### Notable engineering challenges
 
 - Azure for Students subscription region restrictions — had to identify the actual allowed regions via policy rather than the general Azure region list
 - ACR Tasks (remote container builds) is blocked for student subscriptions — worked around by building locally and pushing the image directly
 - Diagnosed a persistent Docker-to-Azure-SQL connection failure by systematically ruling out DNS, network connectivity, TLS certificates, and MTU issues before finding the actual causes: a malformed `.env` file and a Linux-ODBC-driver-specific login format requirement
+- The `:latest`-tag deploy trap above — every step in a deploy (`docker push`, `az containerapp update`) can report success while the running container never actually changes; root-caused by comparing the replica's real start timestamp against the deploy time, not by trusting any command's own "succeeded" output
+- `docker push` can fail with an expired ACR auth token while still leaving the next command in a script free to run — silently redeploying whatever was already in the registry rather than the new build, with no error indicating that's what happened; the fix is always reading the actual push output, not just its exit code
 
 ## Design notes worth remembering
 
@@ -516,9 +574,30 @@ header stay outside the tabs, visible regardless of which one is
 active, since they're context a user wants no matter what they're
 doing.
 
+**Schema setup moved out of the request path (`init_db.py`,
+`entrypoint.sh`).** Table creation for auth/session, inbox-tracking, the
+outbound-email queue, and hold-requests used to run inside `app.py`
+itself — once per process, on whichever page load happened to be the
+first request after a cold start. That still meant a real user's page
+load paid for a multi-second "Connecting..." wait (or, before a retry
+loop existed, a raw exception) for setup work that had nothing to do
+with their own request. `init_db.py` is now a standalone script that
+`entrypoint.sh` runs to completion, in the container, *before* Streamlit
+starts accepting any HTTP traffic at all — so no request, from any user,
+at any time, can race an uninitialized database. The same script is
+just as needed for local dev (see "Setup" above); it isn't an
+Azure-only step.
+
 ## Limitations & Production Considerations
 
-This is a prototype, not a production system:
+This is a prototype/portfolio project, not a production system:
 
 - No real ERP integration — the "ERP" is a mock schema seeded with invented data
 - Product catalog is a hardcoded SKU list in `agent_config.py`'s tool schema, not a real product-catalog lookup
+- The follow-up job for stale Holds (`check_holds.py`) is written and tested but not yet deployed as an actual scheduled job — it only runs when invoked manually today, not on a real cadence
+- One Gmail account (via App Password) does triple duty as the login-code sender, the order-intake IMAP mailbox, and the outbound-reply SMTP sender — not a dedicated transactional email service, and a single point of failure for all three
+- No rate limiting on signup, login-code requests, or login attempts — a real deployment would need this before being open to untrusted traffic
+- SQLite and Azure SQL schemas are hand-maintained in parallel (`setup_db.py`/`setup_db_azure.py`, plus a small `_ensure_column()` migration helper per module for later column additions) rather than through a real migration framework
+- `st.dataframe`'s native rendering (canvas-based, via glide-data-grid) can't be restyled through the app's injected CSS at all — every dataframe in the app (sidebar, History, Outbound Queue) consistently shows Streamlit's default unthemed table look; a known, accepted limitation rather than a bug
+- No structured logging/observability beyond container stdout and Streamlit's own error surface — no request tracing, metrics, or alerting
+- Single-tenant design throughout (one shared `mock_erp.db` / Azure SQL database for every signed-up user) — there's no per-tenant data isolation

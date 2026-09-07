@@ -175,6 +175,92 @@ div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row) div[data-testid="
     height: auto !important;
 }}
 
+/* --- Mobile compact account/settings menu ---
+   Below 640px, the four secondary header controls (auto-approve
+   toggle, theme toggle, "Logged in as X", Log out -- all now grouped
+   under one shared menu_col in app.py, see the comment there) used to
+   each render as their own full-width stacked row, burying the actual
+   tabs/content below a wall of controls before a user reached anything
+   they came for. Replaced with a standard mobile pattern instead: a
+   circular avatar button (the user's first initial) that reveals those
+   controls as a floating dropdown panel when tapped, via a pure-CSS
+   checkbox-hack -- no Streamlit rerun needed just to open/close it. */
+.mobile-menu-checkbox {{
+    /* Visually hidden, not display:none -- stays focusable/operable via
+       its <label> (keyboard and assistive tech included) rather than
+       being pulled out of the accessibility tree entirely. */
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+}}
+.mobile-avatar-btn {{
+    display: none; /* shown only in the mobile media query below */
+}}
+
+@media (max-width: 640px) {{
+    div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row) {{
+        position: relative;
+    }}
+    .mobile-avatar-btn {{
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 44px;
+        height: 44px;
+        min-width: 44px;
+        border-radius: 50%;
+        background: var(--accent);
+        color: var(--accent-ink);
+        font-family: 'Oswald', sans-serif;
+        font-weight: 700;
+        font-size: 1.1rem;
+        cursor: pointer;
+        position: absolute;
+        top: 0;
+        right: 0;
+        z-index: 25;
+        user-select: none;
+    }}
+    /* menu_col is the second (and last) top-level column in the header
+       row -- hidden by default on mobile. */
+    div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row) > div[data-testid="stColumn"]:last-child {{
+        display: none;
+    }}
+    /* Revealed as a floating panel when the avatar is tapped (checkbox
+       :checked) -- :has() targets the shared parent row rather than a
+       sibling combinator, since the checkbox lives inside header_col
+       (the FIRST column), not as a direct sibling of menu_col. */
+    div[data-testid="stHorizontalBlock"]:has(.mobile-menu-checkbox:checked) > div[data-testid="stColumn"]:last-child {{
+        display: block !important;
+        position: absolute;
+        top: 48px;
+        right: 0;
+        width: 240px;
+        min-width: unset !important;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        box-shadow: 0 12px 32px rgba(0,0,0,0.35);
+        padding: var(--space-sm) var(--space-md);
+        z-index: 30;
+    }}
+    /* Inside the open panel, the nested toggle/theme/user row stacks
+       vertically (each control full-width within the 240px panel)
+       instead of trying to stay side by side. */
+    div[data-testid="stHorizontalBlock"]:has(.mobile-menu-checkbox:checked) > div[data-testid="stColumn"]:last-child div[data-testid="stHorizontalBlock"] {{
+        flex-direction: column;
+    }}
+    div[data-testid="stHorizontalBlock"]:has(.mobile-menu-checkbox:checked) > div[data-testid="stColumn"]:last-child div[data-testid="stColumn"] {{
+        min-width: unset !important;
+        width: 100% !important;
+    }}
+    .header-username {{
+        text-align: left !important;
+    }}
+}}
+
 /* --- Section heading: the ONE style for every top-level named section
    inside a tab (e.g. "Agent Execution", "Pending Outbound Emails",
    "Awaiting Customer Reply", "Sent Emails", "Processed Emails") --
@@ -332,14 +418,43 @@ div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row) div[data-testid="
     border-radius: 6px !important;
 }}
 
+/* iOS Safari auto-zooms the whole page when a tapped input's rendered
+   font-size is under 16px -- confirmed via the live DOM that every text
+   input/textarea in this app (login, signup, code entry, email content,
+   sender address, ...) renders at 14px, well under that threshold. The
+   correct fix is a bigger font on the input itself at mobile widths,
+   NOT disabling pinch-zoom via the viewport meta tag (user-scalable=no
+   / maximum-scale=1), which would break zoom for users who rely on it
+   for legibility -- an accessibility regression traded for a cosmetic
+   one. Bare `input`/`textarea`/`select` tag selectors are used here
+   rather than Streamlit-specific classes so this can't silently stop
+   working if a future Streamlit version renames its wrapper classes --
+   every native text-entry element gets this floor, everywhere in the
+   app, with no exceptions to track. Scoped to phone-width viewports
+   only (real tablets start at 768px+ in portrait, where iOS does not
+   apply this zoom behavior) so desktop/tablet keeps its smaller,
+   denser default size. */
+@media (max-width: 640px) {{
+    input, textarea, select {{
+        font-size: 16px !important;
+    }}
+}}
+
 /* Primary button -> manifest "process" stamp button. A button inside
    st.form() (e.g. "Send login code", "Verify code", "Create account")
-   renders with kind="primaryFormSubmit" instead of plain "primary" --
-   confirmed via the live DOM -- so every form-submit button was falling
-   through to Streamlit's unstyled default (red) instead of picking up
-   this rule at all. Both kind values are matched here so any primary
-   button reads the same regardless of whether it lives inside a form. */
-.stButton button[kind="primary"], .stButton button[kind="primaryFormSubmit"] {{
+   renders with kind="primaryFormSubmit" instead of plain "primary" AND
+   wraps in a completely different outer class -- .stFormSubmitButton,
+   not .stButton -- confirmed via the live DOM (both the kind attribute
+   AND the wrapper class differ; an earlier fix here only caught the
+   first mismatch, so .stButton button[kind="primaryFormSubmit"] never
+   actually matched anything -- there is no .stButton ancestor on a
+   form-submit button at all. Caught by rendering the real login screen
+   and checking the button's actual computed background-color, which
+   was still Streamlit's default red despite the CSS rule existing).
+   Both wrapper classes and both kind values are matched here so any
+   primary button reads the same regardless of whether it lives inside
+   a form. */
+.stButton button[kind="primary"], .stFormSubmitButton button[kind="primaryFormSubmit"] {{
     background: var(--accent) !important;
     color: var(--accent-ink) !important;
     border: none !important;
@@ -352,18 +467,19 @@ div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row) div[data-testid="
     transition: transform 0.15s ease, box-shadow 0.15s ease;
     box-shadow: 0 2px 0 rgba(0,0,0,0.25);
 }}
-.stButton button[kind="primary"]:hover, .stButton button[kind="primaryFormSubmit"]:hover {{
+.stButton button[kind="primary"]:hover, .stFormSubmitButton button[kind="primaryFormSubmit"]:hover {{
     transform: translateY(-2px);
     box-shadow: 0 4px 10px rgba(0,0,0,0.25);
 }}
-.stButton button[kind="primary"]:active, .stButton button[kind="primaryFormSubmit"]:active {{
+.stButton button[kind="primary"]:active, .stFormSubmitButton button[kind="primaryFormSubmit"]:active {{
     transform: translateY(0px);
     box-shadow: 0 1px 0 rgba(0,0,0,0.25);
 }}
 
-/* Theme toggle button (secondary) -- same kind-name mismatch as above
-   applies to secondary form-submit buttons (e.g. "Start over"). */
-.stButton button[kind="secondary"], .stButton button[kind="secondaryFormSubmit"] {{
+/* Theme toggle button (secondary) -- same wrapper-class + kind-name
+   mismatch as above applies to secondary form-submit buttons (e.g.
+   "Start over"). */
+.stButton button[kind="secondary"], .stFormSubmitButton button[kind="secondaryFormSubmit"] {{
     border: 1px solid var(--border) !important;
     background: var(--surface) !important;
     color: var(--text) !important;
@@ -376,7 +492,7 @@ div[data-testid="stHorizontalBlock"]:has(.app-header-logo-row) div[data-testid="
    comfortably above this on desktop, but the compact secondary/toggle
    buttons could otherwise end up shorter once padding is squeezed by
    the header's responsive wrapping above. */
-.stButton button {{
+.stButton button, .stFormSubmitButton button {{
     min-height: 44px;
 }}
 

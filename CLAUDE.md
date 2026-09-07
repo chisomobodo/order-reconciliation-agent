@@ -337,8 +337,16 @@ docker build -t reconciliation-agent .
 az acr login --name ca289d1c4e31acr
 docker tag reconciliation-agent ca289d1c4e31acr.azurecr.io/reconciliation-agent:latest
 docker push ca289d1c4e31acr.azurecr.io/reconciliation-agent:latest
-az containerapp update --name reconciliation-agent --resource-group reconciliation-agent-rg --image ca289d1c4e31acr.azurecr.io/reconciliation-agent:latest
 ```
+
+Read the `docker push` output for the final line: `latest: digest: sha256:<digest>`.
+Then deploy pinned to that exact digest, NOT to `:latest`:
+
+```
+az containerapp update --name reconciliation-agent --resource-group reconciliation-agent-rg --image "ca289d1c4e31acr.azurecr.io/reconciliation-agent@sha256:<digest>"
+```
+
+See "Deployment gotchas" below for why the digest-pin step is not optional.
 
 (Container/registry/resource-group names still use the old
 `reconciliation-agent` naming — these are live Azure resource
@@ -363,6 +371,79 @@ Cold starts: Container App scales to zero on idle (free). Use
 `az containerapp update ... --min-replicas 1` temporarily before a
 demo/interview, then `--min-replicas 0` after — leaving it at 1
 permanently costs roughly $13/month.
+
+## Deployment gotchas (read before debugging a "my fix isn't showing up" mystery)
+
+Lost the better part of a session chasing what looked like a live runtime
+bug (a button rendering Streamlit's default red instead of the theme's
+amber, on a fix that was independently confirmed correct in local
+source, correct inside the built Docker image, and had already been
+through a full `docker push` + `az containerapp update` cycle that
+reported success) before finding that none of that actually mattered --
+the running container had never restarted. Read this section FIRST next
+time a fix that checks out everywhere else still isn't visible live;
+don't re-derive it.
+
+**Never deploy using the mutable `:latest` tag alone.**
+`az containerapp update --image ...:latest` does NOT reliably restart a
+running replica just because `:latest` now points to different content
+in the registry. Confirmed directly: `docker push` succeeded and
+reported a genuinely new digest, `az containerapp update` reported
+`"provisioningState": "Succeeded"` and bumped the Container App
+resource's `systemData.lastModifiedAt` to the current time -- and NONE
+of that meant the running container had actually changed.
+`az containerapp replica list ... --query
+"[0].properties.containers[0].runningStateDetails"` showed the exact
+same "Container started at ..." timestamp from a deploy made two days
+earlier, `restartCount: 0` -- the same OS process, never touched, the
+whole time. Azure Container Apps appears to only trigger a real
+revision/restart when the image *reference string itself* changes;
+since `:latest` is always the same string, repeated deploys against it
+can silently leave the old image running indefinitely, with every
+individual step along the way reporting success. This is why the
+"Deployment sequence" above pins to the resolved digest instead of
+`:latest` -- a digest is a different string on every push, so Container
+Apps has no way to mistake it for "no change." Treat that pin step as
+mandatory, not an occasional workaround.
+
+**`docker push` can fail with an ACR auth error while still leaving you
+free to run `az containerapp update` right afterward.** ACR login
+tokens (`az acr login`) expire after a few hours, and a failed push
+doesn't stop the next command in a script/session from running anyway.
+That subsequent `containerapp update` will still report "succeeded" --
+it just redeploys whatever digest was already sitting in the registry,
+not your new build, and gives no error indicating that's what happened.
+Always read the actual `docker push` output and confirm it shows layers
+uploading and ends with a `latest: digest: sha256:...` line, not an
+authentication error, before trusting anything that runs after it. If
+it's been a while since the last login, just re-run `az acr login` --
+harmless if already logged in.
+
+**When "my fix isn't showing up on the live site" happens, verify in
+this exact order** -- each step is a hard, unambiguous check against
+real evidence, not a visual glance at the page or a re-read of the
+source:
+1. Confirm the fix is actually in the local source file (a plain read
+   or grep).
+2. Confirm it's inside the actual **built Docker image**, not just the
+   source tree Docker was pointed at:
+   `docker run --rm --entrypoint sh <image> -c "grep -n '<text>'
+   <path-inside-image>"`
+3. Confirm the Container App is **actually configured to run that exact
+   digest**:
+   `az containerapp show --name reconciliation-agent --resource-group
+   reconciliation-agent-rg --query
+   "properties.template.containers[0].image"`
+   -- compare against the digest reported by your last successful
+   `docker push` (or resolve what `:latest` currently points to in the
+   registry: `az acr repository show --name ca289d1c4e31acr --image
+   reconciliation-agent:latest --query digest`). If steps 1 and 2 both
+   check out but the live site still shows old behavior, the answer is
+   almost certainly here (or in the replica's actual
+   `runningStateDetails` start time, per the first gotcha above) --
+   not a mystery in the application code. Don't go looking for a
+   runtime bug in `build_css()`, `st.markdown()`, or anything else
+   downstream until this step has actually been checked.
 
 ## Known gotchas (don't rediscover these)
 

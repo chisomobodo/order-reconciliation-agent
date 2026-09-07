@@ -19,11 +19,16 @@ def _load_svg(path: str) -> str:
     """Reads an SVG asset's raw markup for inline embedding via
     st.markdown(..., unsafe_allow_html=True). Returns an empty string
     if the file is missing, so a moved/renamed asset degrades to no
-    logo rather than crashing the auth screen."""
+    logo rather than crashing the auth screen -- but prints a loud
+    warning first, so a failed load (e.g. a filename case mismatch that
+    only breaks on Linux, not on a case-insensitive Windows dev
+    machine) is visible in the container logs instead of only visible
+    as a silently missing icon in the browser."""
     try:
         with open(path, encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
+        print(f"WARNING: could not load SVG asset at {path!r} (file not found) -- hero panel will render without its icon.", flush=True)
         return ""
 
 
@@ -318,10 +323,21 @@ div[data-testid="stTextInput"] input {{
     div[data-testid="stHorizontalBlock"]:has(.auth-hero) > div[data-testid="stColumn"] {{
         min-height: auto;
     }}
-    .auth-hero {{ padding: 28px 24px; height: auto; }}
-    .auth-hero-title {{ font-size: 1.9rem; }}
+    .auth-hero {{ padding: 20px 24px; height: auto; }}
+    .auth-hero-title {{ font-size: 1.9rem; margin-top: 8px; }}
+    /* The descriptive paragraph is the single biggest space cost in the
+       hero panel (~100px+ including its own margin) and the least
+       essential to actually operating the login form -- confirmed via
+       direct measurement that with it present, the email field sits
+       below the fold (top: 712px) on an iPhone SE (667px tall) and
+       other common short viewports, forcing a scroll before a user can
+       even see the form they came for. Dropped on mobile so the brand
+       moment (icon, tag, title) stays, but the form is reachable
+       without scrolling on ordinary phone screens. */
+    .auth-hero-sub {{ display: none; }}
+    .auth-hero-stamp {{ margin-top: 12px; }}
     div[data-testid="stHorizontalBlock"]:has(.auth-hero) > div[data-testid="stColumn"]:nth-of-type(2) {{
-        padding: 28px 24px;
+        padding: 20px 24px;
     }}
 }}
 

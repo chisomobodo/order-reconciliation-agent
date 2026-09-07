@@ -47,30 +47,66 @@ def _load_svg(path: str) -> str:
     """Reads an SVG asset's raw markup for inline embedding via
     st.markdown(..., unsafe_allow_html=True). Returns an empty string
     if the file is missing, so a moved/renamed asset degrades to no
-    logo rather than crashing the page."""
+    logo rather than crashing the page -- but prints a loud warning
+    first. A silent empty-string return here was hard to distinguish
+    from "this is just how the header looks" when the file genuinely
+    failed to load (e.g. a case-sensitivity mismatch that only shows up
+    on Linux, not on a Windows dev machine, since NTFS is case-
+    insensitive) -- this makes that failure visible in the container
+    logs instead of only visible as a missing icon in the browser."""
     try:
         with open(path, encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
+        print(f"WARNING: could not load SVG asset at {path!r} (file not found) -- header will render without its icon.", flush=True)
         return ""
 
 
-def _header_logo_html() -> str:
-    """The one branded header lockup (icon + 'Arbiter' wordmark), used
-    for the fully-loaded page AND every loading/waiting/error state
-    that renders before it (DB_INIT_ERROR, the retry-exhausted DB
-    connection handler, the cookie-probe "Checking session..." wait) --
-    those states used to fall back to old plain-text/uppercase markup
-    (.manifest-title) instead of this, causing a visible flash of
-    unbranded content before the real header took over on every single
-    page load. Defined here, near the top of the script, specifically
-    so it's available to those early states -- they run before the
-    header's own code further down. assets/arbiter_icon_header.svg is
-    the mark alone -- no <title>/<desc> (which the browser renders as a
-    hover tooltip on the earlier logo variant) and no background rect
-    (which showed as an unwanted dark box around the icon). The
-    wordmark is a real HTML element here, not baked into the SVG, so it
-    can be styled/positioned independently."""
+def render_app_header() -> str:
+    """The SINGLE SOURCE OF TRUTH for the branded header lockup (icon +
+    'Arbiter' wordmark) -- every state that shows this header, anywhere
+    in the app, MUST call this function rather than writing its own
+    markup. There is no other copy of this HTML in the codebase.
+
+    Current call sites (keep this list accurate if you add another):
+      - DB_INIT_ERROR fallback (below)
+      - the validate-session retry-exhausted error (below)
+      - the main dashboard header, once fully loaded (near the bottom
+        of this file)
+
+    Every remaining call site renders once, in a single script pass, with
+    nothing rerunning/retrying around it first -- header and content
+    appear together as one unit. This wasn't always true: an earlier
+    version of the session-cookie read (a custom component needing a
+    real browser round-trip to resolve) had to retry across many script
+    reruns while it waited, and this function used to be called on every
+    one of those reruns -- producing a staged reveal on literally every
+    page load (logo appears immediately, then the page sits on it while
+    the retries run invisibly, then the real content finally replaces
+    it, confirmed by video). That whole mechanism is gone now (see the
+    session-cookie read further down, which uses st.context.cookies --
+    a synchronous, no-round-trip read with nothing to retry), which is
+    what makes "renders once, as part of the final page" true everywhere
+    this function is called today.
+
+    This consolidation exists because the header used to be written out
+    separately in each of these places -- once as old plain-text/
+    uppercase markup (.manifest-title, no icon at all), and even after
+    that was replaced, as independently copy-pasted icon+wordmark HTML
+    per call site. Both of those let a fix applied to one copy silently
+    fail to reach the others, causing the exact same "wrong/missing
+    header during loading" bug to resurface more than once. A single
+    function that every call site invokes is what actually prevents
+    that class of bug, rather than just patching the latest symptom.
+
+    assets/arbiter_icon_header.svg is the mark alone -- no <title>/
+    <desc> (which the browser renders as a hover tooltip on an earlier
+    logo variant) and no background rect (which showed as an unwanted
+    dark box around the icon). The wordmark is a real HTML element
+    here, not baked into the SVG, so it can be styled/positioned
+    independently. Defined here, near the top of the script, so it's
+    available to the early loading/error states below, which run
+    before the main header's own code further down the file."""
     icon_svg = _load_svg(ARBITER_HEADER_ICON_SVG_PATH)
     icon_html = f'<span class="app-header-icon">{icon_svg}</span>' if icon_svg else ""
     return f"""
@@ -119,7 +155,38 @@ def _sqlite_connection():
 # the same get_connection() pattern agent_engine[_azure].py already use.
 # None when Azure was requested but couldn't be reached (DB_INIT_ERROR is
 # set) -- that's handled before anything tries to call it, below.
-auth_get_connection = get_azure_connection if USE_AZURE_DB else _sqlite_connection
+_get_raw_connection = get_azure_connection if USE_AZURE_DB else _sqlite_connection
+
+# Every single connection in this file goes through auth_get_connection()
+# -- confirmed by grep, there is no other way any code here opens one.
+# That used to mean a direct, unprotected call (get_azure_connection() /
+# sqlite3.connect() with no retry), while a SEPARATE retry-wrapped helper
+# (_connect_with_retry(), used only by the now-removed schema-init code)
+# existed alongside it -- an inconsistency that let a single transient
+# Azure SQL hiccup crash the whole script with a raw pyodbc traceback
+# shown directly to the user (confirmed live: _validate_session_cached,
+# which runs unconditionally on every page load, hit exactly this -- a
+# "Login timeout expired" from pyodbc.connect(), uncaught). Rather than
+# wrap each of the ~18 call sites individually (and risk missing one, or
+# a future call site skipping it the same way), the retry logic lives
+# HERE, inside auth_get_connection() itself -- every existing and future
+# `auth_get_connection()` call gets it automatically, with no per-call-
+# site opt-in required. Same retry shape (5 attempts, 1.5s apart) used
+# throughout the rest of this project's Azure SQL startup/retry paths.
+CONNECT_MAX_ATTEMPTS = 5
+CONNECT_RETRY_DELAY_S = 1.5
+
+
+def auth_get_connection():
+    last_error = None
+    for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
+        try:
+            return _get_raw_connection()
+        except Exception as e:
+            last_error = e
+            if attempt < CONNECT_MAX_ATTEMPTS:
+                time.sleep(CONNECT_RETRY_DELAY_S)
+    raise last_error
 
 # --- Theme state ---
 if "theme" not in st.session_state:
@@ -163,7 +230,7 @@ st.markdown(build_css(st.session_state.theme), unsafe_allow_html=True)
 # connection for auth OR the app, so that error is shown instead of a
 # login form that would just fail on every attempt.
 if DB_INIT_ERROR:
-    st.markdown(_header_logo_html(), unsafe_allow_html=True)
+    st.markdown(render_app_header(), unsafe_allow_html=True)
     # Clean, simple primary message for the end user -- the actual
     # exception and the env vars to check are real diagnostic info
     # (useful to whoever runs/deploys this), but they're internal
@@ -189,124 +256,52 @@ if DB_INIT_ERROR:
 # can race an uninitialized database.
 
 # --- Session cookie: read side ---
-# CookieManager.get()/get_all() hardcode default={} internally (confirmed
-# by reading the installed library's source), so they can NEVER return
-# None -- there is no way, through that public API, to tell "the browser
-# round-trip for this cookie hasn't completed yet" (which should also
-# look like {} on the very first pass) apart from "it completed, and
-# there genuinely is no cookie" (also {}). That ambiguity was the actual
-# bug: a hard refresh could see the not-yet-loaded default and wrongly
-# conclude "no session".
+# st.context.cookies is a native, read-only, synchronous snapshot of the
+# cookies sent with the browser's initial request -- available
+# immediately on the very first script execution. No custom component to
+# mount, no iframe, no postMessage round-trip, no retry loop needed at
+# all. This REPLACES an earlier approach (extra_streamlit_components'
+# CookieManager, read via a raw _cookie_component(method="getAll", ...)
+# call) that needed up to a 30-attempt/12s retry budget to work around
+# that component's real, measured 1.7-9.7s mount+round-trip latency --
+# and, worse, rendering the branded header on every one of those retry
+# iterations produced a staged reveal on literally every single page
+# load (logo appears immediately, then the page sits on it while the
+# retries run, then the real content finally replaces it -- confirmed by
+# video). Switching to this native API removes the wait it was built to
+# survive, not just the visible symptom of it: confirmed directly (real
+# Chrome via Playwright, a cookie set before navigation) that the value
+# is correctly readable on the very first render, no polling required.
 #
-# We read the SAME underlying component function CookieManager wraps,
-# but with our own sentinel default (None) instead, so the two cases are
-# distinguishable. We deliberately do NOT also construct a
-# stx.CookieManager() here for reads -- its __init__ makes its own
-# get_all() call as a side effect, which would mount a second, redundant
-# cookie-reading component alongside this one on every page load, adding
-# unnecessary async race surface during exactly the window we're trying
-# to make reliable. CookieManager is only instantiated later, transiently,
-# at the point .set() is actually needed (login success) -- see below.
-# Budget was originally 6 attempts * 0.35s (~2.1s worst case), sized
-# around a fast local browser's component mount time. Measured directly
-# (real Chrome, Playwright, repeated fresh/uncached page loads against
-# this app): the cookie component's actual mount + document.cookie read +
-# postMessage round-trip took 4.4s-9.7s on a cold/uncached load, and only
-# ~1-1.7s on a warm reload in the same browser -- so almost every FIRST
-# load of a session was blowing through the old ~2.1s budget and falling
-# into the branch below that just waits, silently and indefinitely, for
-# Streamlit's own automatic rerun-on-value-change. That branch still
-# resolves correctly (nothing was ever actually stuck), but it has no
-# visible retry/spinner cadence of its own (each active-loop attempt
-# re-renders a spinner; the fallback is one static, unchanging message),
-# which is what read as "slow, every single reload." 12s of active-retry
-# budget comfortably covers the measured ~9.7s worst case, so the
-# visibly-retrying loop now handles the realistic cold-mount case instead
-# of silently falling through to that quieter fallback.
-COOKIE_PROBE_MAX_ATTEMPTS = 30
-COOKIE_PROBE_RETRY_DELAY_S = 0.4  # ~12s worst case across all retries
-
-if "cookie_probe_attempts" not in st.session_state:
-    st.session_state.cookie_probe_attempts = 0
+# Confirmed via the installed Streamlit version's own source
+# (runtime/context.py): st.context.cookies wraps an immutable snapshot
+# taken at the initial request, not a live-updating view -- so it will
+# NOT reflect a cookie deleted by OUR OWN logout click within the same
+# browser session (that deletion is a real, separate document.cookie
+# write the ALREADY-ESTABLISHED session has no way to see until a whole
+# new request/connection happens). just_logged_out below is what
+# actually covers that gap, exactly as it did before this change.
+#
+# Writing (login) and deleting (logout) cookies still go through
+# stx.CookieManager()/_cookie_component further down in this file --
+# st.context.cookies is read-only, so those two call sites are
+# unaffected by this change.
 if "just_logged_out" not in st.session_state:
     st.session_state.just_logged_out = False
-if "cookie_probe_exhausted" not in st.session_state:
-    st.session_state.cookie_probe_exhausted = False
 
 if st.session_state.get("session_token"):
     # This Python session already knows its own token (e.g. right after a
-    # login in this very tab) -- no need to wait on the cookie round-trip.
+    # login in this very tab) -- no need to re-read the cookie.
     _session_token = st.session_state.session_token
 elif st.session_state.just_logged_out:
     # We just tore this session down ourselves (see the Logout button) --
-    # don't even ask the cookie, and don't run validate_session against a
+    # don't even check the cookie snapshot (see above for why it can't be
+    # trusted here anyway), and don't run validate_session against a
     # token we know is already gone. This is what stops the logout click
     # from being able to briefly show a stale/invalid-session error.
     _session_token = None
-elif st.session_state.cookie_probe_exhausted:
-    # Already gave up resolving the cookie once this browser session --
-    # treat as "no session" rather than mounting the cookie-read
-    # component again. Re-mounting it was the actual bug: the component
-    # function was previously called unconditionally on every single
-    # pass through this branch, including every run AFTER our own retry
-    # budget below was exhausted and had stopped calling st.rerun()
-    # itself. extra_streamlit_components' CookieManager component can
-    # report its value again on its own (not only in direct response to
-    # being re-rendered by us), and Streamlit automatically reruns the
-    # script on ANY reported value from a mounted component -- confirmed
-    # empirically (real browser, WebSocket frames captured) that this
-    # kept the app rerunning indefinitely, with zero user interaction,
-    # long after our own explicit st.rerun() calls had stopped. Never
-    # calling the component again after giving up once is what actually
-    # stops that -- a bounded, one-time retry budget below, followed by
-    # a genuinely final answer, not another indefinite wait.
-    _session_token = None
 else:
-    _raw_cookies = _cookie_component(method="getAll", key="auth_cookie_manager", default=None)
-
-    if _raw_cookies is None:
-        # Not resolved yet on this pass. IMPORTANT: st.rerun() called
-        # from inside the script is purely server-side -- it does NOT
-        # wait on any round-trip to the browser, so calling it
-        # immediately (as an earlier version of this fix did) gives the
-        # component's iframe essentially zero real wall-clock time to
-        # actually mount, read document.cookie, and report back before
-        # we'd already moved on to the "give up" branch. That was why a
-        # hard refresh could still show "logged out" even for a valid
-        # session. The fix is a REAL delay before each retry -- the same
-        # pattern already used for the Azure SQL retry logic below --
-        # so the browser's independent, concurrently-running mount
-        # actually gets time to finish.
-        st.markdown(_header_logo_html(), unsafe_allow_html=True)
-        if st.session_state.cookie_probe_attempts < COOKIE_PROBE_MAX_ATTEMPTS:
-            st.session_state.cookie_probe_attempts += 1
-            with st.spinner("Checking session..."):
-                time.sleep(COOKIE_PROBE_RETRY_DELAY_S)
-            st.rerun()
-
-        # Exhausted every retry (~12s of real waiting) and it's STILL not
-        # back -- conclusively treat this as "no session" (proceed to the
-        # real login screen) instead of parking in "Checking session..."
-        # waiting indefinitely on more messages from the component. That
-        # indefinite wait used to rely on Streamlit's automatic rerun-on-
-        # value-change firing exactly once, when a genuinely slow mount
-        # finally resolves -- but the cookie component doesn't only ever
-        # report once: it can keep posting on its own, and each post
-        # looked like a fresh, legitimate value change, so the "just wait
-        # a bit longer" branch could in practice mean rerunning forever
-        # with the tab sitting idle. A 12s active budget already
-        # comfortably covers real measured mount times (see above), so
-        # concluding here trades an already-rare, self-recoverable edge
-        # case (a hard refresh landing on the login screen despite a
-        # still-valid cookie, fixed by simply reloading again) for
-        # actually going quiet when the script is done, which a
-        # background/idle tab must do.
-        st.session_state.cookie_probe_exhausted = True
-        _session_token = None
-    else:
-        # _raw_cookies is a real dict now (possibly {}) -- definitive answer.
-        st.session_state.cookie_probe_attempts = 0
-        _session_token = _raw_cookies.get("session_token")
+    _session_token = st.context.cookies.get("session_token")
 
 # Validated on every single rerun, not just once -- this is what actually
 # enforces the sliding 20-minute inactivity window (each call refreshes
@@ -327,14 +322,49 @@ else:
 SESSION_VALIDATION_TTL_S = 20
 
 
-@st.cache_data(ttl=SESSION_VALIDATION_TTL_S)
+@st.cache_data(ttl=SESSION_VALIDATION_TTL_S, show_spinner="Loading...")
 def _validate_session_cached(session_token: str) -> dict:
     with closing(auth_get_connection()) as conn:
         return auth.validate_session(conn, session_token)
 
 
 if _session_token:
-    _session_check = _validate_session_cached(_session_token)
+    # This call happens unconditionally on every page load, before
+    # anything else renders -- the highest-frequency, highest-blast-
+    # radius connection in the file. auth_get_connection() above already
+    # retries transient failures, but if Azure SQL is down for longer
+    # than that whole retry budget, the exception still propagates here
+    # and must not reach the user as a raw traceback -- same clean
+    # message + expandable technical-details pattern already used for
+    # DB_INIT_ERROR above, rather than Streamlit's default error box.
+    try:
+        # A cache MISS here (first check of a given token, or the TTL
+        # expired) makes Streamlit's cache machinery show its OWN default
+        # spinner while the wrapped function actually runs, labeled with
+        # the function's raw name/args, e.g. "Running
+        # `_validate_session_cached(...)`." -- confirmed via a real
+        # screenshot, raw internal code shown to a real user, worse now
+        # that auth_get_connection() can retry for several real seconds
+        # underneath it (see above), stretching how long that name stays
+        # visible. Checked Streamlit's actual cache_utils.py source
+        # rather than guessing: this spinner is controlled ONLY by the
+        # show_spinner= argument on the @st.cache_data decorator itself
+        # (set below) -- wrapping the call site in a manual st.spinner
+        # here would NOT suppress it (that only happens when the call is
+        # nested inside ANOTHER cached function, not inside a plain
+        # st.spinner block), it would just add a second, redundant one.
+        _session_check = _validate_session_cached(_session_token)
+    except Exception as e:
+        st.markdown(render_app_header(), unsafe_allow_html=True)
+        st.error("Couldn't connect to the database. Please try again shortly.")
+        with st.expander("Technical details"):
+            st.markdown(
+                f"Could not verify your session against {DB_MODE} after "
+                f"{CONNECT_MAX_ATTEMPTS} attempts: {e}\n\n"
+                "This is usually a transient cold-start delay -- reloading the page in "
+                "a few moments often resolves it."
+            )
+        st.stop()
 else:
     _session_check = {"status": "Invalid"}
 
@@ -343,6 +373,75 @@ if _session_check.get("status") == "Valid":
     st.session_state.just_logged_out = False
 else:
     st.session_state.pop("session_token", None)
+
+# --- One-shot hard reload, right after login succeeds ---
+# Root cause of the post-login FOUC (dashboard briefly rendering with no
+# CSS applied -- huge unconstrained header icon, system fonts, no card
+# borders -- confirmed reproducible on every login, never on a fresh
+# load or manual refresh): the verify_clicked handler below mounts a
+# stx.CookieManager(key="set_cookie_manager") component to WRITE the new
+# session cookie. Mounting ANY custom component for the first time in a
+# browser tab makes it report a value back to Streamlit -- and per the
+# same mechanism already diagnosed once before in this file (the old
+# cookie-read probe's spontaneous-rerun bug), that report triggers an
+# involuntary rerun of the WHOLE script, on its own, outside anything
+# this code controls.
+#
+# Confirmed directly: instrumented that handler with a debug file write
+# placed right after its own deliberate st.rerun()-equivalent call --
+# even though auth.verify_login_code() had already committed successfully
+# (confirmed via a separate DB check), that debug write NEVER happened.
+# The involuntary rerun above pre-empts the deliberate one before it
+# finishes, every single time. Whatever code the login handler puts
+# AFTER setting the cookie -- a plain st.rerun(), or an attempted real
+# browser reload -- is dead code; the involuntary rerun always wins the
+# race and is what actually lands the user on the dashboard. That
+# explains the FOUC: this involuntary rerun does a normal in-place
+# React reconciliation from the (small, shallow) login screen straight
+# to the (much bigger) dashboard tree -- exactly the large structural
+# DOM swap the FOUC has always tracked with, and exactly the one case
+# no other rerun in the app ever has to do again afterward.
+#
+# Fighting to make one SPECIFIC rerun win that race is fragile -- it
+# depends on exact timing of a component's own frontend lifecycle, not
+# on anything this script can control. Instead: catch the transition
+# here, at the one place EVERY rerun passes through right after a
+# session is confirmed valid, regardless of which particular rerun (the
+# deliberate one or the involuntary one) gets here first with a freshly
+# populated session_token. needs_hard_reload_after_login is a plain
+# session_state write made inside the login handler alongside its other
+# post-verification state (session_token, login_step, etc.), and --
+# this part matters -- all of it is written BEFORE that handler's own
+# spinner/sleep, not after. Confirmed directly (per-line debug writes):
+# Streamlit's rerun-cancellation can interrupt a running script even
+# mid-time.sleep(), not just at the next st.* call, so anything written
+# only after that sleep was silently lost whenever the involuntary rerun
+# preempted it -- moving these writes earlier, to right after the DB
+# call, is what makes them reliably land regardless of which rerun gets
+# cut off. Whichever rerun is the first to see the flag true does a REAL
+# top-level browser reload -- landing on a
+# genuinely fresh HTML/CSS/JS document, the same FOUC-free path already
+# confirmed for every ordinary page load and manual refresh -- then
+# clears the flag immediately so the reload's own next script run (which
+# also passes through this exact check) renders the dashboard normally
+# instead of looping.
+#
+# A <meta http-equiv="refresh"> tag, not a <script>-based reload: an
+# earlier attempt used components.html() to run
+# `window.parent.location.reload()` from JS, which never worked --
+# components.html() always renders into a sandboxed iframe lacking
+# allow-top-navigation, so the browser silently blocks that frame from
+# navigating its parent no matter what runs inside it. st.markdown(...,
+# unsafe_allow_html=True) avoids the iframe entirely (inserted directly
+# into the main page's own DOM) but can't run a <script> tag either --
+# elements inserted via innerHTML never execute embedded scripts, by DOM
+# spec. A <meta refresh> tag is subject to neither restriction: it's not
+# a script, and it's not inside an iframe -- browsers act on it as soon
+# as it's inserted anywhere in the document, not only at initial parse.
+if st.session_state.get("needs_hard_reload_after_login"):
+    st.session_state.needs_hard_reload_after_login = False
+    st.markdown('<meta http-equiv="refresh" content="0">', unsafe_allow_html=True)
+    st.stop()
 
 
 def _render_auth_screen():
@@ -429,26 +528,64 @@ def _render_auth_screen():
                             expires_at=datetime.now(timezone.utc) + timedelta(days=7),
                             key="set_session_cookie",
                         )
-                        # This is the FIRST time this specific component
-                        # key has ever been mounted in this browser tab
-                        # (unlike the read-side probe, which is warm from
-                        # page load) -- its iframe needs real time to
-                        # load and actually execute `document.cookie =
-                        # ...`. The st.rerun() a few lines down tears
-                        # this component out of the tree (login_step
-                        # flips away from "code", so it won't be
-                        # recreated), which can abort that in-flight
-                        # write if it fires before the browser's had a
-                        # chance to finish it -- this was why the cookie
-                        # never actually showed up in the browser at all,
-                        # not merely a slow-to-be-read one.
-                        with st.spinner("Signing you in..."):
-                            time.sleep(0.6)
+                        # Every session_state write for this login happens
+                        # HERE, immediately, BEFORE the spinner/sleep below
+                        # -- not after it, which is where this code used to
+                        # put them. Mounting the CookieManager .set() call
+                        # just above, the FIRST time this exact component
+                        # key is used in this browser tab, makes it report
+                        # a value back to Streamlit -- and per the same
+                        # mechanism already diagnosed once before in this
+                        # file (the old cookie-read probe's spontaneous-
+                        # rerun bug), that report triggers an involuntary
+                        # rerun of the whole script, on its own, racing
+                        # this handler's own execution.
+                        #
+                        # Confirmed directly, with a debug file write
+                        # placed at each successive line of this handler:
+                        # execution reliably reaches the point right
+                        # before the spinner/sleep below, but the write
+                        # placed right AFTER that spinner/sleep block
+                        # never happens -- Streamlit's rerun-cancellation
+                        # interrupts the running script mid-block, even
+                        # mid-time.sleep(), not just at the next st.*
+                        # call. Anything that used to be written after the
+                        # sleep (session_token, login_step, etc.) was
+                        # therefore never actually committed by this run
+                        # at all -- only the cookie survived, because that
+                        # write happens client-side, inside the
+                        # component's own iframe, decoupled from this
+                        # Python thread's fate.
                         st.session_state.session_token = session_token
                         st.session_state.just_logged_out = False
                         st.session_state.login_step = "credentials"
                         st.session_state.login_user_id = None
                         st.session_state.login_message = None
+                        # Tells the one-shot check near the top of this
+                        # file (right after session validation, see
+                        # "needs_hard_reload_after_login" there for the
+                        # full explanation) to force a real browser
+                        # reload instead of an in-place render, the next
+                        # time ANY rerun sees a valid session_token here
+                        # -- whichever rerun that turns out to be: this
+                        # handler's own eventual st.rerun() below if it
+                        # gets to run uninterrupted, or the involuntary
+                        # one that may well fire first.
+                        st.session_state.needs_hard_reload_after_login = True
+                        # Purely cosmetic from here down: a moment showing
+                        # "Signing you in..." gives the cookie write time
+                        # to actually land in the browser before whichever
+                        # rerun tears this component out of the tree
+                        # (login_step already flipped away from "code"
+                        # above, so it won't be recreated on the next
+                        # run) -- this was why the cookie never showed up
+                        # in the browser at all, not merely a slow-to-be-
+                        # read one. Nothing after this point is load-
+                        # bearing: even if THIS run gets cut off mid-sleep
+                        # by the involuntary rerun, everything that
+                        # matters has already committed above.
+                        with st.spinner("Signing you in..."):
+                            time.sleep(0.6)
                     else:
                         st.session_state.login_message = (result.get("message", "Verification failed."), "error")
                     st.rerun()
@@ -751,10 +888,19 @@ DB_SNAPSHOT_MAX_ATTEMPTS = 5  # Azure SQL only -- see get_db_snapshot
 DB_SNAPSHOT_RETRY_DELAY_S = 1.5
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=5, show_spinner=False)
 def get_db_snapshot():
     """Returns (inventory_df, orders_df, error). error is None on success;
     when set, the sidebar shows it instead of crashing the app.
+
+    show_spinner=False: the caller already wraps this call in its own
+    st.spinner("Connecting...") -- confirmed via Streamlit's actual
+    cache_utils.py source that a cache miss's own default spinner
+    ("Running `get_db_snapshot()`.") is NOT suppressed just because the
+    call site happens to already be inside a manual st.spinner block
+    (only nesting inside ANOTHER cached function does that), so without
+    this, both spinners would render, one showing the raw function name.
+    This was the same class of leak _validate_session_cached() had.
 
     Cached for 5s (@st.cache_data(ttl=5)) so the almost-every-rerun nature
     of Streamlit (button clicks, toggles, dropdown changes) doesn't re-hit
@@ -809,77 +955,108 @@ def load_sample_emails():
 # --- Header ---
 # DB_INIT_ERROR can't be set here -- the auth gate above already st.stop()s
 # on it before this point, so there's no error branch to show.
-header_col, approve_toggle_col, theme_toggle_col, user_col = st.columns([3.2, 1.4, 1, 1.8])
+#
+# Computed here (rather than down inside `with user_col:` where it used
+# to live) because the mobile avatar button below also needs it, and
+# that button renders inside header_col, before user_col exists.
+first_name = (CURRENT_USER.get("name") or "").split()
+first_name = first_name[0] if first_name else "User"
+
+# Two top-level columns, not four -- header_col (logo/badge/avatar) and
+# ONE menu_col holding every secondary control (auto-approve toggle,
+# theme toggle, "Logged in as X", Log out) via its own nested row. This
+# is what lets the mobile dropdown below work at all: CSS can hide/show
+# a single stColumn as one floating panel, but hiding/showing several
+# independent top-level columns the same way makes them each their own
+# absolutely-positioned box, stacking on top of each other instead of
+# flowing as a list. Wrapping them in one shared column first means
+# there's only ever one box to reposition.
+header_col, menu_col = st.columns([3.2, 4.2])
 with header_col:
     st.markdown(
-        _header_logo_html() + f'<div style="margin-top: 8px;">{db_mode_badge_html(DB_MODE, bool(DB_INIT_ERROR))}</div>',
+        render_app_header() + f'<div style="margin-top: 8px;">{db_mode_badge_html(DB_MODE, bool(DB_INIT_ERROR))}</div>'
+        # Mobile-only compact menu trigger -- a circular avatar button
+        # showing the user's first initial, which reveals the auto-
+        # approve toggle, theme toggle, "Logged in as X", and Log out as
+        # a dropdown panel when tapped, instead of each rendering as its
+        # own full-width stacked row (the old mobile behavior, which
+        # pushed actual app content below a wall of secondary controls).
+        # Pure CSS checkbox-hack: the checkbox has no visuals of its own
+        # (display:none) and only drives :checked state; the label is
+        # the visible tap target. Hidden entirely above the mobile
+        # breakpoint -- see theme.py's @media (max-width: 640px) block,
+        # which is also what makes menu_col hide by default and reveal
+        # as the dropdown.
+        + '<input type="checkbox" id="mobile-header-menu" class="mobile-menu-checkbox">'
+        + f'<label for="mobile-header-menu" class="mobile-avatar-btn">{html.escape(first_name[:1].upper())}</label>',
         unsafe_allow_html=True,
     )
-with approve_toggle_col:
-    st.write("")
-    st.toggle("Auto-approve changes", key="auto_approve", value=False)
-with theme_toggle_col:
-    st.write("")
-    label = "☀️ Light mode" if st.session_state.theme == "dark" else "🌙 Dark mode"
-    if st.button(label, type="secondary", use_container_width=True):
-        st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
-        st.rerun()
-with user_col:
-    st.write("")
-    # First name + Logout as one right-aligned group at the far right of
-    # the header, rather than the full name stacked above a full-width
-    # button.
-    first_name = (CURRENT_USER.get("name") or "").split()
-    first_name = first_name[0] if first_name else "User"
-    name_col, logout_col = st.columns([1.3, 1], gap="small")
-    with name_col:
-        st.markdown(
-            f"""
-            <div style="text-align:right; font-family:'IBM Plex Mono',monospace;
-                        font-size:0.75rem; color:var(--text-dim); padding-top:8px;
-                        padding-bottom:16px;">
-                Logged in as <b style="color:var(--text);">{first_name}</b>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with logout_col:
-        if st.button("Log out", type="secondary", use_container_width=True):
-            with closing(auth_get_connection()) as _conn:
-                auth.log_out(_conn, st.session_state.get("session_token"))
-            # Evicts just this token's cached _validate_session_cached()
-            # result. Without this, another tab/session still holding this
-            # same now-deleted token in ITS OWN session_state (so it never
-            # touches the cookie/rerun-gate above at all -- see the
-            # `if st.session_state.get("session_token")` short-circuit near
-            # the top of the file) would keep reading a stale "Valid"
-            # result out of the cache for up to SESSION_VALIDATION_TTL_S
-            # more seconds after this logout, instead of finding out on its
-            # very next rerun the way it did before that cache existed.
-            _validate_session_cached.clear(st.session_state.get("session_token"))
-            # Not cookie_manager.delete() -- it does `del self.cookies[cookie]`
-            # internally, which raises KeyError whenever that key isn't
-            # already present in the manager's local dict (e.g. if the
-            # cookie component's initial load returned {} before this
-            # click). That uncaught exception was rendering as a brief
-            # error before the page settled on the login screen. Calling
-            # the same underlying component method directly does the
-            # actual browser-side deletion without that fragile bookkeeping.
-            _cookie_component(method="delete", cookie="session_token", key="delete_session_cookie", default=False)
-            # Same reasoning as the .set() call on login: "delete_session_
-            # cookie" is a brand new component key, first mounted right
-            # here, and the st.rerun() below would otherwise tear it out
-            # of the tree before its iframe has had real time to actually
-            # run the browser-side deletion. Without this, the DB session
-            # is correctly gone (auth.log_out() above) and this tab
-            # behaves as logged out (just_logged_out=True below), but the
-            # stale browser cookie could persist and resurface on a later
-            # fresh load.
-            with st.spinner("Logging out..."):
-                time.sleep(0.6)
-            st.session_state.pop("session_token", None)
-            st.session_state.just_logged_out = True
+with menu_col:
+    approve_toggle_col, theme_toggle_col, user_col = st.columns([1.4, 1, 1.8])
+    with approve_toggle_col:
+        st.write("")
+        st.toggle("Auto-approve changes", key="auto_approve", value=False)
+    with theme_toggle_col:
+        st.write("")
+        label = "☀️ Light mode" if st.session_state.theme == "dark" else "🌙 Dark mode"
+        if st.button(label, type="secondary", use_container_width=True):
+            st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
             st.rerun()
+    with user_col:
+        st.write("")
+        # First name + Logout as one right-aligned group at the far
+        # right of the header, rather than the full name stacked above
+        # a full-width button. (first_name is computed above, near
+        # header_col -- the mobile avatar button needs it too.)
+        name_col, logout_col = st.columns([1.3, 1], gap="small")
+        with name_col:
+            st.markdown(
+                f"""
+                <div class="header-username" style="text-align:right; font-family:'IBM Plex Mono',monospace;
+                            font-size:0.75rem; color:var(--text-dim); padding-top:8px;
+                            padding-bottom:16px;">
+                    Logged in as <b style="color:var(--text);">{first_name}</b>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with logout_col:
+            if st.button("Log out", type="secondary", use_container_width=True):
+                with closing(auth_get_connection()) as _conn:
+                    auth.log_out(_conn, st.session_state.get("session_token"))
+                # Evicts just this token's cached _validate_session_cached()
+                # result. Without this, another tab/session still holding this
+                # same now-deleted token in ITS OWN session_state (so it never
+                # touches the cookie/rerun-gate above at all -- see the
+                # `if st.session_state.get("session_token")` short-circuit near
+                # the top of the file) would keep reading a stale "Valid"
+                # result out of the cache for up to SESSION_VALIDATION_TTL_S
+                # more seconds after this logout, instead of finding out on its
+                # very next rerun the way it did before that cache existed.
+                _validate_session_cached.clear(st.session_state.get("session_token"))
+                # Not cookie_manager.delete() -- it does `del self.cookies[cookie]`
+                # internally, which raises KeyError whenever that key isn't
+                # already present in the manager's local dict (e.g. if the
+                # cookie component's initial load returned {} before this
+                # click). That uncaught exception was rendering as a brief
+                # error before the page settled on the login screen. Calling
+                # the same underlying component method directly does the
+                # actual browser-side deletion without that fragile bookkeeping.
+                _cookie_component(method="delete", cookie="session_token", key="delete_session_cookie", default=False)
+                # Same reasoning as the .set() call on login: "delete_session_
+                # cookie" is a brand new component key, first mounted right
+                # here, and the st.rerun() below would otherwise tear it out
+                # of the tree before its iframe has had real time to actually
+                # run the browser-side deletion. Without this, the DB session
+                # is correctly gone (auth.log_out() above) and this tab
+                # behaves as logged out (just_logged_out=True below), but the
+                # stale browser cookie could persist and resurface on a later
+                # fresh load.
+                with st.spinner("Logging out..."):
+                    time.sleep(0.6)
+                st.session_state.pop("session_token", None)
+                st.session_state.just_logged_out = True
+                st.rerun()
 
 st.write("")
 
