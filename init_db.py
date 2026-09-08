@@ -33,6 +33,7 @@ import auth
 import email_ingestion
 import hold_requests
 import outbound_email
+import rbac
 
 USE_AZURE_DB = os.environ.get("USE_AZURE_DB") == "true"
 
@@ -91,6 +92,10 @@ def main():
     with closing(_connect_with_retry()) as conn:
         hold_requests.init_hold_requests_schema(conn, is_azure=USE_AZURE_DB)
     print("[init_db] hold requests schema OK", flush=True)
+
+    with closing(_connect_with_retry()) as conn:
+        rbac.init_rbac_schema(conn, is_azure=USE_AZURE_DB)
+    print("[init_db] rbac schema OK", flush=True)
 
     print("[init_db] Schema initialization complete.", flush=True)
 

@@ -90,6 +90,21 @@ are invented.
       already-open `conn` instead of opening and closing its own; a
       single "Process" click used to open 5+ separate Azure SQL
       connections in sequence, now opens exactly one
+- [x] Role-based access control (`rbac.py`) — a signup allowlist, three
+      roles (admin/approver/reviewer) with an editable permission
+      mapping (who can process emails, approve order changes, approve
+      outbound emails, manage users), and an audit log recording who
+      did what. A genuinely separate **Admin** page (`admin_page.py`,
+      via Streamlit's `st.navigation`/`st.Page`) — not another tab —
+      appears in navigation only for an admin; see "Roles & Admin
+      Access" below
+- [x] Restructured into a real Streamlit multipage app — the dashboard
+      (`dashboard_page.py`) and the admin page (`admin_page.py`) are
+      separate page files, routed to by `app.py` (now just the entry
+      point: auth gate, session validation, role lookup, then
+      `st.navigation`); shared connection/backend logic lives in
+      `app_core.py` so both pages can reach it without re-executing
+      `app.py` itself (see "Design notes" below)
 
 ## How it works
 
@@ -117,7 +132,17 @@ are invented.
 agent_config.py            System prompt + tool definitions (3 tools)
 agent_engine.py             Orchestration loop, SQLite backend
 agent_engine_azure.py        Orchestration loop, Azure SQL backend (pyodbc)
-app.py                        Streamlit dashboard
+app.py                        Entry point / router -- auth gate, session
+                               validation, role lookup, then st.navigation()
+app_core.py                    Shared connection/backend logic + branded
+                               header, used by app.py and both pages below
+dashboard_page.py              Main dashboard page (the five tabs) -- routed
+                               to via st.navigation() for every signed-in user
+admin_page.py                  Admin page (User Management, Permission
+                               Mapping, Audit Log) -- routed to via
+                               st.navigation() ONLY when role == 'admin'
+rbac.py                         Signup allowlist, roles + editable permission
+                                 mapping, audit log
 theme.py                       Design system (shipping-manifest aesthetic, stamp badges)
 auth.py                         Login/sign-up backend (bcrypt + emailed code + sessions)
 auth_theme.py                    Login/sign-up screen design, restyled in the app's palette
@@ -125,7 +150,7 @@ email_ingestion.py                Real IMAP ingestion of customer emails from a 
 outbound_email.py                  Approval-gated outbound email queue (draft -> human approves -> sent)
 hold_requests.py                    Hold-state tracking + four-layer reply-to-clarification matching
 check_holds.py                       Standalone script: drafts follow-ups for overdue Holds
-init_db.py                            Schema init for auth/inbox/outbound/hold tables (run once, before app.py)
+init_db.py                            Schema init for auth/inbox/outbound/hold/rbac tables (run once, before app.py)
 setup_db.py                     Mock ERP schema + seed data (SQLite)
 setup_db_azure.py                Mock ERP schema + seed data (Azure SQL)
 generate_test_emails.py           Generates sample_emails.json via Claude
@@ -148,13 +173,13 @@ pip install -r requirements.txt
 export ANTHROPIC_API_KEY=your_key_here  # or set in your shell profile
 python3 setup_db.py   # mock ERP schema + seed data (products, orders, stock)
 python3 init_db.py    # app schema: auth/session, inbox-tracking, outbound-email
-                       # queue, hold-requests tables
+                       # queue, hold-requests, and rbac tables
 ```
 
 These are two separate one-time scripts because they own different tables:
 `setup_db.py` seeds the mock ERP the agent reasons about; `init_db.py` creates
 everything the app itself needs to run (login, email tracking, the approval
-queue, Hold state). `init_db.py` used to run automatically inside `app.py` on
+queue, Hold state, roles/permissions). `init_db.py` used to run automatically inside `app.py` on
 first page load — it's now a required, separate step (see "Design notes"
 below for why), so **`streamlit run app.py` will fail without it** if this is
 a first-time setup.
@@ -242,6 +267,95 @@ box around the code-entry step's buttons). All fields go through
 `st.form`/`st.form_submit_button` so Enter submits a whole group at once.
 See "Design notes" below for the session-cookie reliability work, which
 was the more substantial fix in this area.
+
+### Roles & Admin Access
+
+On top of authentication, `rbac.py` adds a signup allowlist, three roles
+(**admin**, **approver**, **reviewer**) with an editable permission
+mapping, and an audit log.
+
+The signup allowlist has two layers, checked in this order by
+`rbac.is_email_allowed_to_signup()`:
+
+1. **A database table (`allowed_signup_emails`)** — this is the one an
+   admin manages day-to-day, live, from the Admin page's **Signup
+   Access** section (below): add an email, it can sign up immediately;
+   revoke it, it's blocked again immediately. No env var edit or
+   redeploy needed for the common case of adding a new person. Adding
+   an email can also send that person a notification email with the
+   app's sign-in link (`rbac.send_signup_access_email`) — reuses the
+   same `GMAIL_ADDRESS`/`GMAIL_APP_PASSWORD` as login codes, and reads
+   the sign-in link itself from `APP_URL`.
+2. **`ALLOWED_SIGNUP_EMAILS`** (comma-separated, case-insensitive env
+   var) — a permanent fallback checked if the email isn't in the DB
+   table. Exists so an admin can never lock themselves out even if the
+   database table is empty or something's wrong with it.
+
+**If NEITHER the DB table nor the env var has any entries at all,
+sign-up is open to anyone** — a deliberate choice so a fresh setup
+doesn't silently lock everyone out before the first admin has had a
+chance to add anyone to either list.
+
+```bash
+export ALLOWED_SIGNUP_EMAILS=you@example.com,teammate@example.com  # optional -- permanent fallback
+export ADMIN_EMAILS=you@example.com                                # optional
+export APP_URL=https://reconciliation-agent.bravecoast-56485b41.swedencentral.azurecontainerapps.io  # optional
+```
+
+- **`APP_URL`** — the app's own public URL, included in the "you've
+  been granted access" notification email so the recipient has a
+  direct sign-in link instead of having to be told it separately.
+  Optional: if unset, the email still sends, just with "(Ask your
+  administrator for the sign-in link.)" in place of a URL. For local
+  dev this would be `http://localhost:8501` (or whichever port);
+  there's no correct default to fall back to automatically, since the
+  app has no way to know its own externally-reachable address.
+- **`ADMIN_EMAILS`** (comma-separated, case-insensitive) — any email
+  listed here is force-promoted to the `admin` role the moment it signs
+  up OR logs in (checked both places, so it doesn't matter which one
+  happens first for a brand-new account). This is the bootstrap: it's
+  how the very first admin gets created at all, without a
+  chicken-and-egg "an admin has to promote you" flow. Every other role
+  change after that happens through the Admin page itself (see below),
+  not through further env var edits — though re-adding an email to
+  `ADMIN_EMAILS` and logging in again always re-grants admin, which
+  doubles as a recovery path if every admin account is ever
+  accidentally demoted.
+
+Once signed in as an admin, an **Admin** entry appears in Streamlit's
+page navigation (built via `st.navigation`/`st.Page` — a genuinely
+separate page, not another tab) with four sections:
+
+- **User Management** — every user, with a role dropdown + Save per row
+  (`rbac.set_user_role`).
+- **Signup Access** — the database allowlist described above: every
+  currently-allowed email (who added it, when), an "Add email" field
+  (with an "Also send them a notification email" checkbox, checked by
+  default — un-check it to add someone without emailing them), and a
+  Revoke button per row (`rbac.add_allowed_signup_email` /
+  `rbac.remove_allowed_signup_email`). Shows the real outcome inline
+  after adding, including whether the notification email actually
+  sent, not just a generic "done."
+- **Permission Mapping** — a grid (rows = roles, columns = permissions:
+  `can_process_emails`, `can_approve_order_changes`,
+  `can_approve_outbound_emails`, `can_manage_users`) with checkboxes
+  that take effect immediately (`rbac.set_role_permission`).
+- **Audit Log** — every role change, permission change, signup
+  allowlist edit, order-change approval, and outbound-email
+  approve/reject, with who did it, most recent first (`rbac.log_audit`
+  / `rbac.get_audit_log`).
+
+The Admin page genuinely isn't reachable by anyone else, not just
+hidden: it's only ever added to the list passed to `st.navigation()`
+when the current user's role is `'admin'`, and Streamlit falls back to
+the default (dashboard) page for any URL that doesn't match a page in
+that list — so a non-admin who guesses or bookmarks the admin URL still
+never reaches it, confirmed directly (not just reasoned about) during
+this feature's own testing.
+
+A denied action elsewhere in the app (an approval button without the
+right permission) disables that specific button with a short caption
+explaining why, rather than doing nothing on click.
 
 ### Email Ingestion
 
@@ -587,6 +701,40 @@ starts accepting any HTTP traffic at all — so no request, from any user,
 at any time, can race an uninitialized database. The same script is
 just as needed for local dev (see "Setup" above); it isn't an
 Azure-only step.
+
+**Multipage restructuring (`app.py`, `app_core.py`, `dashboard_page.py`,
+`admin_page.py`).** Adding the Admin page as a genuinely separate page
+(not another tab) meant moving off a single flat script. `app.py` is now
+just the entry point — page config, CSS, the auth gate, session
+validation, role lookup, then `st.navigation()` — and hands off to
+`dashboard_page.py` or `admin_page.py` as plain Python functions.
+Connection handling, backend selection, and the branded header moved
+into a third file, `app_core.py`, that both pages import — deliberately
+NOT something either page reaches by `import app` directly. Streamlit
+runs `app.py` as `__main__` (`streamlit run app.py`), and Python's
+import machinery doesn't register a script run that way under its own
+filename in `sys.modules` — so a later `import app` from another file
+loads it a SECOND time as a distinct module object, re-running every
+top-level statement in it, including `st.set_page_config()`, which
+raises the moment it executes twice in one script run. `app_core.py`
+holding the shared pieces instead is what avoids that entirely.
+
+**RBAC extends the check/commit split to "who's allowed to click
+approve" (`rbac.py`, `dashboard_page.py`).** The core safety principle
+already covered database writes (`verify_order_modification` vs
+`commit_order_modification`) and outbound email (`queue_draft` vs
+`approve_and_send`) — RBAC adds a third layer on top of both: not just
+"is this action reviewed by a human," but "is THIS human allowed to
+review it." Permissions are read live from the database on every page
+render, never cached, the same principle `check_order_modification`
+already follows ("a stale cache can never be the reason an approval
+decision is wrong") — a role change made in the Admin page takes effect
+on the affected user's very next rerun. The auto-approve toggle is
+gated by the same `can_approve_order_changes` permission as the manual
+"Approve & Apply" button, and the commit path itself re-checks that
+permission a second time right before writing — otherwise auto-approve
+would let anyone bypass the button's own gate just by leaving the
+toggle on.
 
 ## Limitations & Production Considerations
 

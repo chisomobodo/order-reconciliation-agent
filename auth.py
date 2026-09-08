@@ -149,9 +149,17 @@ def verify_password(plaintext_password: str, stored_hash: str) -> bool:
 # ---------------------------------------------------------------------
 
 def sign_up(conn, email: str, name: str, password: str) -> dict:
-    """Creates a new user. Returns {'status': 'Success'} or
-    {'status': 'Error', 'message': ...} (e.g. email already registered).
-    Takes an already-open connection -- caller owns its lifecycle."""
+    """Creates a new user. Returns {'status': 'Success', 'user_id': ...}
+    or {'status': 'Error', 'message': ...} (e.g. email already
+    registered). Takes an already-open connection -- caller owns its
+    lifecycle.
+
+    user_id is looked up via a follow-up SELECT rather than
+    cursor.lastrowid -- pyodbc doesn't reliably support lastrowid, so
+    this project's convention (see outbound_email.queue_draft) is
+    always a portable SELECT instead. Added so callers (rbac.py's admin
+    bootstrap) can act on the new user immediately after signup,
+    without a second round-trip of their own."""
     cursor = conn.cursor()
 
     cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
@@ -166,7 +174,11 @@ def sign_up(conn, email: str, name: str, password: str) -> dict:
         (email, name, password_hash, now),
     )
     conn.commit()
-    return {"status": "Success", "message": "Account created. You can now log in."}
+
+    cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
+    row = cursor.fetchone()
+
+    return {"status": "Success", "message": "Account created. You can now log in.", "user_id": row[0] if row else None}
 
 
 # ---------------------------------------------------------------------
