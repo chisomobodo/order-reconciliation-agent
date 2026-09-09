@@ -1,5 +1,5 @@
 anthropic>=0.40.0
-streamlit>=1.38.0
+streamlit==1.63.0
 pandas>=2.2.0
 pyodbc>=5.1.0
 bcrypt>=4.1.0
