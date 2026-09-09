@@ -105,6 +105,15 @@ are invented.
       `st.navigation`); shared connection/backend logic lives in
       `app_core.py` so both pages can reach it without re-executing
       `app.py` itself (see "Design notes" below)
+- [x] Session affinity (`stickySessions`) enabled on the Azure Container
+      App — required, not optional, once the app runs as more than one
+      replica; see "Docker & Deployment" below for why and how it was
+      diagnosed
+- [x] White-flash-on-load fixed across all three layers a real network
+      round trip actually exposes (native theme config, atomic CSS
+      injection, a patched `index.html`) — verified with live
+      network/WebSocket tracing against the deployed app, not just
+      local testing; see "Design notes" below
 
 ## How it works
 
@@ -158,7 +167,12 @@ run_batch_test.py                  Batch-runs sample_emails.json through the age
 test_agent.py                       Quick manual test (2 hand-picked emails)
 test_azure_connection.py             Sanity check for the Azure SQL backend
 assets/                                Arbiter branding: header/hero icons, favicon
-Dockerfile                            Container build (Python 3.11 bookworm, ODBC Driver 18)
+.streamlit/config.toml                Native Streamlit theme (dark palette) -- fixes most of the
+                                        white-flash-on-load; see "Design notes" below for why this
+                                        alone isn't the whole fix
+Dockerfile                            Container build (Python 3.11 bookworm, ODBC Driver 18);
+                                        also patches Streamlit's own served index.html -- see
+                                        "Design notes" below
 entrypoint.sh                          Container entrypoint: runs init_db.py, then starts Streamlit
 .dockerignore                          Excludes venv, local DB, .env, etc. from the build context
 requirements.txt                        Python dependencies
@@ -267,6 +281,34 @@ box around the code-entry step's buttons). All fields go through
 `st.form`/`st.form_submit_button` so Enter submits a whole group at once.
 See "Design notes" below for the session-cookie reliability work, which
 was the more substantial fix in this area.
+
+Two more reliability layers sit underneath the basic flow, both driven
+by real bugs caught in production, not anticipated in advance:
+
+- **Recovering a lost mid-login session.** The code-entry step depends
+  on `st.session_state` to remember which user is mid-login — state
+  that can vanish between requesting a code and entering it (a fresh
+  server-side session on a WebSocket reconnect, a different backend
+  replica handling the reconnect, etc.), which silently bounced a user
+  back to the credentials screen with no error and no way to tell why.
+  `request_login_code()` now also hands back an opaque `browser_token`,
+  stored both in `login_codes` and a short-lived browser cookie; if
+  `login_step` is ever missing but that cookie is present,
+  `restore_pending_login()` looks the pending login back up server-side
+  and the user lands back on the code-entry step instead of getting
+  silently sent to the start.
+- **The post-login reload.** Verifying a code triggers a real, full
+  browser reload (a `<meta http-equiv="refresh">` tag, not a `<script>`
+  — Streamlit's `components.html()` renders into a sandboxed iframe
+  that can't navigate the parent page, and a `<script>` inserted via
+  `st.markdown(unsafe_allow_html=True)` never executes, by DOM spec) so
+  the dashboard's very first paint is a genuinely fresh page load, not
+  a rerun racing its own CSS. The reload only fires once a real
+  cookie-readback confirms the session cookie actually landed in the
+  browser first (bounded retries, evidence-based timing — see
+  "Session affinity" under "Docker & Deployment" below; this exact flow
+  is why it matters). See "Design notes" for the full history of what
+  didn't work here first.
 
 ### Roles & Admin Access
 
@@ -546,6 +588,50 @@ every individual step reports success. A digest is a different string
 on every push, so pinning to it is what actually guarantees a deploy
 takes effect.
 
+### Session affinity (required, not optional)
+
+`st.session_state` lives entirely in one replica's process memory. Azure
+Container Apps' `stickySessions` ingress setting defaults to unset —
+functionally "none" — meaning a fresh connection or reconnect can land
+on *any* currently-running replica, with no guarantee of hitting the one
+holding a given user's actual session state. Under real autoscaling
+(confirmed directly: a short burst of test traffic scaled this app from
+1-2 replicas to 8-9), that's routine, not an edge case, and it's exactly
+what caused the post-login reload (see "Login & Authentication" above)
+to sometimes land on a logged-out screen in production despite passing
+every local test. Fix:
+
+```bash
+az containerapp ingress sticky-sessions set --name reconciliation-agent \
+  --resource-group reconciliation-agent-rg --affinity sticky
+```
+
+Verify it actually took — `az containerapp show --name reconciliation-agent
+--resource-group reconciliation-agent-rg --query
+"properties.configuration.ingress.stickySessions"` should show
+`{"affinity": "sticky"}`, not `null`. Treat this as a required part of
+deployment, not a one-time fix: if the Container App or its ingress
+config is ever recreated, re-check this before assuming a session/login
+bug is a code problem.
+
+One consequence worth knowing before debugging a "missing" log line:
+`az containerapp logs show` only ever returns ONE replica's logs (its
+own `--help` text says so), so a print statement that genuinely ran can
+still come back with zero matches if a different replica handled that
+request. Real cross-replica visibility needs Log Analytics directly:
+
+```bash
+az extension add --name log-analytics --yes
+az monitor log-analytics query --workspace <workspace-customerId> \
+  --analytics-query "ContainerAppConsoleLogs_CL | where Log_s contains '<search term>' | order by TimeGenerated asc | project TimeGenerated, ContainerGroupName_s, Log_s"
+```
+
+(`<workspace-customerId>` comes from `az containerapp env show --name
+<env> --resource-group reconciliation-agent-rg --query
+"properties.appLogsConfiguration.logAnalyticsConfiguration.customerId"`;
+keep `ContainerGroupName_s` — the replica name — in the projection, since
+that's what makes a cross-replica issue visible at all.)
+
 ### Notable engineering challenges
 
 - Azure for Students subscription region restrictions — had to identify the actual allowed regions via policy rather than the general Azure region list
@@ -553,6 +639,8 @@ takes effect.
 - Diagnosed a persistent Docker-to-Azure-SQL connection failure by systematically ruling out DNS, network connectivity, TLS certificates, and MTU issues before finding the actual causes: a malformed `.env` file and a Linux-ODBC-driver-specific login format requirement
 - The `:latest`-tag deploy trap above — every step in a deploy (`docker push`, `az containerapp update`) can report success while the running container never actually changes; root-caused by comparing the replica's real start timestamp against the deploy time, not by trusting any command's own "succeeded" output
 - `docker push` can fail with an expired ACR auth token while still leaving the next command in a script free to run — silently redeploying whatever was already in the registry rather than the new build, with no error indicating that's what happened; the fix is always reading the actual push output, not just its exit code
+- A post-login reload bug "confirmed locally" twice, and failed live both times — the real root causes (missing session affinity, a too-short cookie-confirmation retry budget) only exist once the app runs as more than one replica, which local dev can never reproduce; see "Session affinity" above
+- Don't guess a timing/retry budget for anything crossing a real network hop — a cookie-readback loop tuned locally (8 attempts, 0.35s apart) looked solved every time locally, but live Log Analytics data showed it repeatedly exhausting the whole budget with the probe never once reporting ready; the real budget (15 attempts, 0.6s apart) was sized from actual observed timestamps in production logs, then confirmed against the same query that the "gave up" warning dropped to zero
 
 ## Design notes worth remembering
 
@@ -736,6 +824,61 @@ permission a second time right before writing — otherwise auto-approve
 would let anyone bypass the button's own gate just by leaving the
 toggle on.
 
+**White-flash-on-load: three layers, because each one alone only closes
+part of the gap.** Every fresh page load briefly showed a white
+background before the app's dark theme applied — small, but visible on
+every single load, not just cold starts. Each layer below was added
+only after live network/WebSocket tracing (not local testing, which
+consistently understated the problem — loopback timing isn't
+representative of a real cross-region connection) showed the previous
+one hadn't actually closed the gap, just shrunk or relocated it:
+
+1. **`.streamlit/config.toml`** (native theme) — read by the Streamlit
+   *server* at startup and sent to the frontend in its own early
+   WebSocket session-bootstrap frames, independently of and much
+   earlier than the app's own Python script reaching its CSS-injection
+   line. Fixes the long, script-dependent wait (was: background stayed
+   white for the entire time app.py's own DB/auth logic took to run;
+   now: dark within ~100-150ms on a fast connection).
+2. **Atomic CSS injection (`app.py`, `theme.py`, `auth_theme.py`)** —
+   `theme.py`'s `build_css()` and `auth_theme.py`'s `build_auth_css()`
+   used to be two separate `st.markdown()` calls, sent as two separate
+   WebSocket deltas, with real script execution in between (DB checks,
+   session validation). Streamlit paints each delta as it arrives, not
+   after the whole script finishes, so there was a real window on the
+   login screen where one had painted and the other hadn't — confirmed
+   directly from a mid-rerun screenshot. Fixed by concatenating both
+   into one `st.markdown()` call, so they arrive as one delta; the
+   auth-only selectors that used to be safe only because they were
+   injected exclusively on the login screen (e.g. hiding the sidebar)
+   are now scoped with `body:has(.auth-hero)` so the merge can't leak
+   onto the real dashboard.
+3. **A patched `index.html` (`Dockerfile`)** — even with (1) and (2),
+   live tracing against the deployed URL (not localhost) found a
+   genuine ~330-380ms white period *after* the page's own `load` event:
+   Streamlit's own compiled frontend mounts React with its own built-in
+   default *light* theme immediately, via a runtime-injected global
+   stylesheet, before the WebSocket-delivered dark theme overrides it —
+   fast on loopback, real on an actual network round trip. The
+   Dockerfile now patches Streamlit's own served `index.html` at build
+   time to inline `<style>html,body{background:#14181C !important}</style>`
+   directly in `<head>`, so the browser paints dark from the very first
+   HTML byte — no JS execution or WebSocket round trip required. The
+   `!important` matters: confirmed live that Streamlit's own competing
+   rule doesn't use it, so without it the two rules tie on specificity
+   and whichever loads later (always Streamlit's own, since it's
+   injected by JS after this static HTML has parsed) wins. Verified via
+   the same live tracing method afterward: 0 background-color samples
+   were still white after the first response byte, across repeated
+   runs — what's left is only the network/TLS/TTFB time before any
+   response has arrived at all, which no app-side config can act on.
+   This patch is why `requirements.txt` pins `streamlit==1.63.0` instead
+   of a floating `>=` range — it depends on that exact version's
+   generated `index.html` still opening with a literal `<head>` tag; the
+   Dockerfile step's own `grep -q` check turns a future mismatch (e.g.
+   after a deliberate Streamlit upgrade) into a loud build failure
+   instead of a silent no-op.
+
 ## Limitations & Production Considerations
 
 This is a prototype/portfolio project, not a production system:
@@ -749,3 +892,5 @@ This is a prototype/portfolio project, not a production system:
 - `st.dataframe`'s native rendering (canvas-based, via glide-data-grid) can't be restyled through the app's injected CSS at all — every dataframe in the app (sidebar, History, Outbound Queue) consistently shows Streamlit's default unthemed table look; a known, accepted limitation rather than a bug
 - No structured logging/observability beyond container stdout and Streamlit's own error surface — no request tracing, metrics, or alerting
 - Single-tenant design throughout (one shared `mock_erp.db` / Azure SQL database for every signed-up user) — there's no per-tenant data isolation
+- Single Azure region, no CDN/edge presence — real page-load time depends on how far a visitor is from Sweden Central; directly measured via live network tracing at 200ms-1.5s+ time-to-first-byte alone depending on conditions, which a global deployment would need a CDN in front of to smooth out
+- Session affinity (`stickySessions`, see "Docker & Deployment" above) is a hard requirement for this app to behave correctly under autoscaling, not an optimization — a design that would need reworking (e.g. externalizing session state to Redis/a database) to run correctly without it at real scale
