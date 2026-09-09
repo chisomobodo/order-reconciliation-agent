@@ -58,13 +58,33 @@ RUN chmod +x entrypoint.sh
 #
 # This inlines the dark background directly into index.html's own
 # <head>, so the browser paints dark from the very first byte of HTML --
-# no JS execution and no WebSocket round trip required. That closes the
-# ~365ms bundle-mount-to-theme-delivery gap; what's left after this is
+# no JS execution and no WebSocket round trip required. Confirmed via
+# live tracing this closes the PRE-mount portion of the gap (dark now
+# paints before the page's own `load` event, not after) -- but on its
+# own it did NOT reduce the total visible flash duration, because of a
+# second mechanism only found by re-tracing after deploying this: once
+# Streamlit's React app mounts (right around `load`), it injects its
+# OWN runtime stylesheet (<style data-emotion="st-emotion-cache-global">)
+# containing `body { background-color: rgb(255,255,255); ... }` as part
+# of its default light-theme base styles -- entirely independent of
+# config.toml. That rule and this one have IDENTICAL specificity (bare
+# `body`), and neither originally used !important (confirmed directly
+# via getPropertyPriority on both, live), so the tie went to whichever
+# was inserted into the DOM later -- which is always Streamlit's own
+# runtime rule, since JS always runs after this static HTML has already
+# parsed. It only got corrected once the WebSocket delivered the real
+# theme and Streamlit rewrote that same stylesheet -- so the white
+# period just relocated to straddle `load` instead of following it,
+# same ~330-380ms total both before and after.
+#
+# !important on OUR rule (added below) is what actually closes this:
+# since Streamlit's competing rule doesn't use it either, ours now wins
+# the cascade regardless of insertion order. What's left after this is
 # only the genuinely unavoidable time-to-first-byte sliver before ANY
 # response has arrived at all, which no app-side or theme configuration
-# can act on (confirmed: every background-color sample taken during that
-# pre-response window showed no document yet, not "white" -- there is
-# nothing to paint, by construction, until the first response byte
+# can act on (confirmed: every background-color sample taken during
+# that pre-response window showed no document yet, not "white" -- there
+# is nothing to paint, by construction, until the first response byte
 # lands).
 #
 # FRAGILE ON PURPOSE, not overlooked: this depends on Streamlit's
@@ -75,13 +95,15 @@ RUN chmod +x entrypoint.sh
 # then just as silently stop matching. The grep -q right after the sed
 # turns that into a loud BUILD FAILURE instead: if you deliberately
 # bump the pinned Streamlit version, this step will tell you immediately
-# whether the patch still applies, rather than quietly shipping the
-# flash again with no signal that anything broke.
+# whether the patch still applies -- and if Streamlit's OWN global
+# stylesheet ever starts using !important too, this same tie-breaking
+# logic stops working and needs re-verifying with live tracing again,
+# not just re-trusting this comment.
 RUN STREAMLIT_STATIC_DIR="$(python -c 'import streamlit, os; print(os.path.join(os.path.dirname(streamlit.__file__), "static"))')" \
     && test -f "$STREAMLIT_STATIC_DIR/index.html" \
     && grep -q '<head>' "$STREAMLIT_STATIC_DIR/index.html" \
-    && sed -i 's|<head>|<head>\n    <style>html,body{background:#14181C}</style>|' "$STREAMLIT_STATIC_DIR/index.html" \
-    && grep -q 'background:#14181C' "$STREAMLIT_STATIC_DIR/index.html"
+    && sed -i 's|<head>|<head>\n    <style>html,body{background:#14181C !important}</style>|' "$STREAMLIT_STATIC_DIR/index.html" \
+    && grep -q 'background:#14181C !important' "$STREAMLIT_STATIC_DIR/index.html"
 
 # This container is always the Azure-backed version -- no point running
 # SQLite inside a stateless container that gets replaced on every deploy.
