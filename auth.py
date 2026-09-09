@@ -114,6 +114,28 @@ CREATE TABLE users (
 """
 
 
+def _ensure_column(cursor, is_azure: bool, table: str, column: str, sqlite_type: str, azure_type: str):
+    """Adds `column` to `table` if it isn't already there. Needed because
+    CREATE TABLE IF NOT EXISTS (SQLite) / IF OBJECT_ID(...) IS NULL CREATE
+    TABLE (Azure) are no-ops once the table already exists from an earlier
+    deploy -- a column only added to the schema string above would never
+    actually reach a database that was set up before this change. Same
+    helper, duplicated per module, as email_ingestion.py/hold_requests.py/
+    outbound_email.py already use for the identical problem."""
+    if is_azure:
+        cursor.execute(
+            "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND COLUMN_NAME = ?",
+            (table, column),
+        )
+        if not cursor.fetchone():
+            cursor.execute(f"ALTER TABLE {table} ADD {column} {azure_type}")
+    else:
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cursor.fetchall()}
+        if column not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sqlite_type}")
+
+
 def init_auth_schema(conn, is_azure: bool):
     """Creates the users/login_codes/sessions tables if they don't exist.
     Call this once alongside the existing ERP schema setup. Takes an
@@ -128,6 +150,12 @@ def init_auth_schema(conn, is_azure: bool):
                 cursor.execute(statement)
     else:
         cursor.executescript(schema)
+    conn.commit()
+
+    # login_codes.browser_token: added after login_codes already existed
+    # in deployed databases -- see request_login_code()/restore_pending_
+    # login() for what this is for (recovering a lost mid-login session).
+    _ensure_column(cursor, is_azure, "login_codes", "browser_token", "TEXT", "NVARCHAR(64)")
     conn.commit()
 
 
@@ -215,8 +243,24 @@ def _send_code_email(to_email: str, code: str):
 
 def request_login_code(conn, email: str, password: str) -> dict:
     """Step 1 of login: verify password, then email a fresh code.
-    Returns {'status': 'Success', 'user_id': ...} or an Error status.
-    Takes an already-open connection -- caller owns its lifecycle."""
+    Returns {'status': 'Success', 'user_id': ..., 'browser_token': ...}
+    or an Error status. Takes an already-open connection -- caller owns
+    its lifecycle.
+
+    browser_token is a random, opaque, unguessable value (same
+    secrets.token_urlsafe generation as session_token below) stored
+    alongside this code and handed back to the caller to set as a
+    short-lived browser cookie -- see restore_pending_login() for why:
+    the code-entry step otherwise depends ENTIRELY on st.session_state
+    (login_step/login_user_id) to remember which user is mid-login, and
+    that state can be lost between requesting a code and entering it
+    (a fresh server-side session on a WebSocket reconnect, a different
+    backend replica, etc.), silently bouncing the user back to the
+    credentials screen with no error and no way to tell why. Deliberately
+    an opaque token looked up server-side, not the raw user_id itself --
+    a raw id in a cookie would let anyone set it to an arbitrary value
+    and attempt to guess a DIFFERENT user's code without ever knowing
+    their password."""
     cursor = conn.cursor()
 
     cursor.execute("SELECT id, password_hash FROM users WHERE email = ?", (email,))
@@ -230,11 +274,12 @@ def request_login_code(conn, email: str, password: str) -> dict:
         return {"status": "Error", "message": "Incorrect password."}
 
     code = _generate_code()
+    browser_token = secrets.token_urlsafe(32)
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=CODE_VALID_MINUTES)).isoformat()
 
     cursor.execute(
-        "INSERT INTO login_codes (user_id, code, expires_at, used) VALUES (?, ?, ?, 0)",
-        (user_id, code, expires_at),
+        "INSERT INTO login_codes (user_id, code, expires_at, used, browser_token) VALUES (?, ?, ?, 0, ?)",
+        (user_id, code, expires_at, browser_token),
     )
     conn.commit()
 
@@ -243,7 +288,52 @@ def request_login_code(conn, email: str, password: str) -> dict:
     except Exception as e:
         return {"status": "Error", "message": f"Could not send verification email: {e}"}
 
-    return {"status": "Success", "user_id": user_id, "message": "A verification code has been emailed to you."}
+    return {
+        "status": "Success",
+        "user_id": user_id,
+        "browser_token": browser_token,
+        "message": "A verification code has been emailed to you.",
+    }
+
+
+def restore_pending_login(conn, browser_token: str, is_azure: bool) -> dict:
+    """Looks up the user_id for a still-valid, not-yet-used login code by
+    its browser_token -- see request_login_code()'s docstring for why
+    this exists. Returns {'status': 'Success', 'user_id': ...} if the
+    token matches an unused, unexpired code, or {'status': 'Invalid'}
+    otherwise (unknown token, code already used, or code expired -- all
+    treated the same: there's nothing left to resume).
+
+    Deliberately has no separate expiry bookkeeping of its own: it just
+    reuses the underlying code's own `used`/`expires_at`, so a code that
+    gets verified or times out normally also stops being resumable,
+    automatically, with no extra cleanup step needed here."""
+    if not browser_token:
+        return {"status": "Invalid"}
+
+    cursor = conn.cursor()
+    if is_azure:
+        cursor.execute(
+            "SELECT TOP 1 user_id, expires_at FROM login_codes "
+            "WHERE browser_token = ? AND used = 0 ORDER BY id DESC",
+            (browser_token,),
+        )
+    else:
+        cursor.execute(
+            "SELECT user_id, expires_at FROM login_codes "
+            "WHERE browser_token = ? AND used = 0 ORDER BY id DESC LIMIT 1",
+            (browser_token,),
+        )
+    row = cursor.fetchone()
+
+    if not row:
+        return {"status": "Invalid"}
+
+    user_id, expires_at = row
+    if _parse_datetime(expires_at) < datetime.now(timezone.utc):
+        return {"status": "Invalid"}
+
+    return {"status": "Success", "user_id": user_id}
 
 
 # ---------------------------------------------------------------------

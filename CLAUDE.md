@@ -445,6 +445,81 @@ source:
    runtime bug in `build_css()`, `st.markdown()`, or anything else
    downstream until this step has actually been checked.
 
+## Multi-replica gotchas (Streamlit's session model vs. autoscaling)
+
+Spent a long session chasing a post-login reload bug that "confirmed
+locally" not once but twice, and both times the fix genuinely worked
+locally and still failed live. The actual root causes were never
+reachable from local testing at all — they only exist once the app is
+running as more than one replica, which local dev (always exactly one
+process) can never reproduce. Read this before trusting any "confirmed
+locally" claim for session/login/cookie-adjacent behavior in this app,
+and before spending another session rediscovering any of the three
+lessons below.
+
+**Session affinity is not optional for this app.** Streamlit's
+`st.session_state` lives entirely in ONE replica's process memory, tied
+to a specific script-execution session. Azure Container Apps'
+`stickySessions` ingress setting defaults to unset (`null`) --
+functionally "none" -- meaning a fresh connection, or a reconnect, can
+land on ANY currently-running replica with no guarantee of hitting the
+one that has this user's actual session_state. Under real autoscaling
+(confirmed directly: a short burst of test traffic scaled this app from
+1-2 replicas to 8-9), that's not a rare edge case, it's routine. Fixed
+with:
+```
+az containerapp ingress sticky-sessions set --name reconciliation-agent --resource-group reconciliation-agent-rg --affinity sticky
+```
+Verify it actually took: `az containerapp show --name reconciliation-agent
+--resource-group reconciliation-agent-rg --query
+"properties.configuration.ingress.stickySessions"` should show
+`{"affinity": "sticky"}`, not `null`. This has to be treated as a
+required part of this app's deployment, not a one-time fix -- if the
+Container App or its ingress config is ever recreated, check this
+again before assuming session/login bugs are a code problem.
+
+**`az containerapp logs show` only ever shows ONE replica.** Its own
+`--help` text says so directly ("logs are only taken from one revision,
+replica, and container"), but it's easy to miss and the symptom looks
+exactly like "no logs at all" -- confirmed directly: repeated
+`az containerapp logs show --tail 300` calls came back with zero
+matches for print statements that WERE executing, simply because the
+specific replica that handled that request wasn't the one the command
+happened to pick. For real visibility across every replica (which
+autoscaling makes the normal case, not the exception), query Log
+Analytics directly instead:
+```
+az extension add --name log-analytics --yes
+az monitor log-analytics query --workspace <workspace-customerId> \
+  --analytics-query "ContainerAppConsoleLogs_CL | where Log_s contains '<search term>' | order by TimeGenerated asc | project TimeGenerated, ContainerGroupName_s, Log_s"
+```
+The workspace's `customerId` (GUID) comes from `az containerapp env show
+--name <env> --resource-group reconciliation-agent-rg --query
+"properties.appLogsConfiguration.logAnalyticsConfiguration.customerId"`.
+`ContainerGroupName_s` is the replica name -- keep it in the projection,
+it's exactly what makes cross-replica issues (like the one above)
+visible in the first place, since you can literally see the same login
+flow's log lines split across several different replica names.
+
+**Don't guess a timing/retry budget for anything that crosses a real
+network hop -- measure it from real production logs, then size the
+budget from that data.** A cookie-readback confirmation loop tuned on
+local testing (8 attempts, 0.35s apart, ~3s total) looked completely
+solved locally, every single time. Live, real `az monitor
+log-analytics query` output showed it repeatedly exhausting that entire
+budget with the probe never once reporting ready in that window -- not
+"just barely too slow", genuinely not enough time under real cloud
+network/current-load conditions for the very first component mount to
+finish. There was no way to derive the right number analytically; it
+came directly from watching real timestamps in real logs across several
+live attempts and sizing the new budget (15 attempts, 0.6s apart, ~9s
+total) to comfortably cover what was actually observed, then confirming
+via the SAME log query that the widened budget brought the "gave up"
+warning down to zero across a fresh batch of live attempts. The
+general principle: local/loopback timing is not a valid stand-in for
+real inter-service latency for anything that has to survive a genuine
+network round-trip in production.
+
 ## Known gotchas (don't rediscover these)
 
 1. **Debian `apt-key` is deprecated/removed on newer releases.** Use

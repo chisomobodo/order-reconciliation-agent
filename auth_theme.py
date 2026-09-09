@@ -42,12 +42,42 @@ AUTH_FONTS_IMPORT = """
 def build_auth_css(theme_name: str) -> str:
     """Reuses the same --bg/--surface/--accent CSS variables theme.py
     already defines (call build_css() first, this just adds auth-screen-
-    specific rules on top)."""
+    specific rules on top).
+
+    Injected UNCONDITIONALLY, bundled into the same st.markdown() call as
+    build_css() at the very top of app.py -- NOT called separately inside
+    _render_auth_screen() any more. That used to be two independent
+    st.markdown() calls, sent as two independent WebSocket deltas,
+    separated by ~270 lines of real script execution (DB_INIT_ERROR
+    check, session-cookie read, _validate_session_cached, the post-login
+    reload state machine) -- Streamlit's frontend paints each delta as it
+    arrives rather than waiting for the whole script to finish, so there
+    was a genuine window where build_css() had painted (dark background,
+    styled buttons/tabs/stamps) but this hadn't yet (native fonts, an
+    unconstrained SVG icon, the raw "Press Enter to submit form" hint) --
+    confirmed directly from a mid-rerun screenshot on the code-entry
+    screen. Bundling both into ONE markdown call makes them one delta,
+    closing the window entirely instead of just shrinking it.
+
+    That merge means every rule below now runs on EVERY page, including
+    the real dashboard/admin pages, not just the auth screen -- so any
+    selector that isn't already scoped to auth-only class names
+    (.auth-hero, .auth-tabs, etc, which simply don't exist in the DOM
+    outside this screen and are therefore harmless everywhere) is scoped
+    under `body:has(.auth-hero)` below. That container-query-style
+    relational selector only matches while the auth screen's own hero
+    panel is actually present in the DOM -- this file already relied on
+    the same :has() mechanism further down (the stHorizontalBlock rule),
+    so this isn't a new browser-support dependency."""
     return f"""
 {AUTH_FONTS_IMPORT}
 <style>
-/* Hide default Streamlit chrome on the auth screen for a cleaner look */
-[data-testid="stSidebar"] {{ display: none; }}
+/* Hide default Streamlit chrome on the auth screen for a cleaner look.
+   Scoped to body:has(.auth-hero) -- unlike the rest of this file, this
+   selector is a bare testid with no auth-only class of its own, and a
+   REAL, populated sidebar exists on the dashboard/admin pages, so this
+   must never apply there. */
+body:has(.auth-hero) [data-testid="stSidebar"] {{ display: none; }}
 
 /* --- Split hero/form layout ---
    Styled directly on Streamlit's OWN column containers (confirmed
@@ -208,27 +238,27 @@ div[data-testid="stHorizontalBlock"]:has(.auth-hero) > div[data-testid="stColumn
    cutting through the rounded field. The border now lives on the root
    element instead, and the inner <input> is made borderless/
    transparent so there's only ever one visible edge. */
-div[data-testid="stTextInput"] {{
+body:has(.auth-hero) div[data-testid="stTextInput"] {{
     animation: authSlideUp 0.5s ease-out both;
 }}
-div[data-testid="stTextInput"] label {{
+body:has(.auth-hero) div[data-testid="stTextInput"] label {{
     font-family: 'IBM Plex Mono', monospace !important;
     font-size: 0.68rem !important;
     letter-spacing: 0.1em;
     text-transform: uppercase;
     color: var(--text-dim) !important;
 }}
-div[data-testid="stTextInputRootElement"] {{
+body:has(.auth-hero) div[data-testid="stTextInputRootElement"] {{
     background: var(--surface) !important;
     border: 1px solid var(--border) !important;
     border-radius: 12px !important;
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }}
-div[data-testid="stTextInputRootElement"]:focus-within {{
+body:has(.auth-hero) div[data-testid="stTextInputRootElement"]:focus-within {{
     border-color: var(--accent) !important;
     box-shadow: 0 0 0 3px rgba(232,162,61,0.15) !important;
 }}
-div[data-testid="stTextInput"] input {{
+body:has(.auth-hero) div[data-testid="stTextInput"] input {{
     background: transparent !important;
     border: none !important;
     box-shadow: none !important;
@@ -239,14 +269,21 @@ div[data-testid="stTextInput"] input {{
 
 /* Streamlit's built-in "Press Enter to submit form" / "Press Enter to
    apply" hint -- unavoidable through the public API, so hidden via CSS
-   instead. Confirmed testid from the installed frontend build. */
-[data-testid="InputInstructions"] {{
+   instead. Confirmed testid from the installed frontend build. Scoped
+   to the auth screen: this hint is arguably fine to hide everywhere,
+   but scoping keeps this merge from changing any dashboard behavior
+   that wasn't asked for. */
+body:has(.auth-hero) [data-testid="InputInstructions"] {{
     display: none;
 }}
 
 /* Primary pill button (reuse existing .stButton primary styling from
-   theme.py, this just adds the pill radius + a subtle press animation) */
-.stButton button[kind="primary"] {{
+   theme.py, this just adds the pill radius + a subtle press animation).
+   Scoped: .stButton button[kind="primary"] is a bare selector that
+   matches every primary button in the app, including the dashboard's --
+   theme.py already gives those their own radius, which this must not
+   override outside the auth screen. */
+body:has(.auth-hero) .stButton button[kind="primary"] {{
     border-radius: 999px !important;
     animation: authSlideUp 0.5s ease-out 0.4s both;
 }}
@@ -298,8 +335,9 @@ div[data-testid="stTextInput"] input {{
 @media (prefers-reduced-motion: reduce) {{
     div[data-testid="stHorizontalBlock"]:has(.auth-hero), .auth-hero-logo, .auth-hero-tag,
     .auth-hero-title, .auth-hero-sub, .auth-hero-stamp, .auth-form-title,
-    .auth-form-caption, .auth-tabs, div[data-testid="stTextInput"],
-    .stButton button[kind="primary"], .auth-message {{
+    .auth-form-caption, .auth-tabs,
+    body:has(.auth-hero) div[data-testid="stTextInput"],
+    body:has(.auth-hero) .stButton button[kind="primary"], .auth-message {{
         animation: none !important;
         opacity: 1 !important;
         transform: none !important;
